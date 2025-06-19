@@ -5,6 +5,7 @@ import time
 import ast
 import re
 import os
+import json
 from typing import Dict, Any, Tuple, Optional
 
 class DeepSeekAnalyzer:
@@ -630,7 +631,9 @@ if __name__ == "__main__":
     INPUT_FILE = "sample_3.csv"  # 输入文件路径（支持 .csv, .xlsx, .xls）
     OUTPUT_FILE = "output_with_analysis.csv"  # 输出文件路径
     # API_KEY = "sk-044fb6603b7b4185b4ea6c876df52833"  # 替换为你的DeepSeek API密钥
-    API_KEY = os.getenv("DeepSeek_API_KEY")  # 替换为你的DeepSeek API密钥
+    with open("config.json", "r") as f:
+        config = json.load(f)
+    API_KEY = config["DEEPSEEK_API_KEY"]  # 从配置文件获取API密钥
     SHEET_NAME = None  # Excel工作表名称，None表示使用第一个工作表
     BATCH_SIZE = 5  # 每处理5条记录保存一次分片
     SAVE_CHUNKS = True  # 是否保存分片文件
