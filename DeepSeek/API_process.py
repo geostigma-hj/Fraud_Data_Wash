@@ -7,6 +7,7 @@ import re
 import os
 import json
 from typing import Dict, Any, Tuple, Optional
+import concurrent.futures
 
 class DeepSeekAnalyzer:
     def __init__(self, api_key: str):
@@ -303,7 +304,7 @@ def create_chunk_filename(base_filename: str, chunk_num: int, total_chunks: int 
         return f"{name}_chunk_{chunk_num:03d}{ext}"
 
 def process_file(input_file: str, output_file: str, api_key: str, batch_size: int = 5, 
-                sheet_name: str = None, save_chunks: bool = True, **file_kwargs):
+                sheet_name: str = None, save_chunks: bool = True, max_workers: int=5, **file_kwargs):
     """
     处理文件（支持CSV和XLSX）
     
@@ -357,38 +358,40 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
     total_chunks = (len(df) + batch_size - 1) // batch_size if save_chunks else None
     chunk_num = 0
     
-    for idx, row in df.iterrows():
+    def get_ds_result(idx, row):
+        # 先基于 row 复制一个新行出来
+        new_row = row.copy()
         try:
             print(f"处理第 {idx + 1}/{len(df)} 条记录...")
             
-            func_body = row['func_body']
+            func_body = new_row['func_body']
             if pd.isna(func_body) or func_body == '':
-                df.at[idx, 'ds_think'] = '函数体为空'
-                df.at[idx, 'ds_output'] = ''
-                df.at[idx, 'ds_result'] = '无漏洞'  # 新增
-                df.at[idx, 'is_correct'] = '×'
-                df.at[idx, 'correct_output'] = ''
-                continue
+                new_row['ds_think'] = '函数体为空'
+                new_row['ds_output'] = ''
+                new_row['ds_result'] = '无漏洞'  # 新增
+                new_row['is_correct'] = '×'
+                new_row['correct_output'] = ''
+                return new_row
             
             # 调用API分析
             reasoning_content, content = analyzer.analyze_function(func_body)
             
             # 存储结果
-            df.at[idx, 'ds_think'] = reasoning_content
-            df.at[idx, 'ds_output'] = content
+            new_row['ds_think'] = reasoning_content
+            new_row['ds_output'] = content
             
             # 提取CWE并检查正确性
             extracted_cwe = analyzer.extract_cwe_from_output(content)
-            df.at[idx, 'ds_result'] = format_cwe_result(extracted_cwe)  # 新增
+            new_row['ds_result'] = format_cwe_result(extracted_cwe)  # 新增
             
             original_cwe = row['cwe']
             is_correct = analyzer.check_cwe_correctness(original_cwe, extracted_cwe)
-            df.at[idx, 'is_correct'] = is_correct
+            new_row['is_correct'] = is_correct
             
             # 根据正确性处理correct_output
             if is_correct == '√':
                 # 如果正确，直接复制ds_output到correct_output
-                df.at[idx, 'correct_output'] = content
+                new_row['correct_output'] = content
                 print(f"第 {idx + 1} 条处理完成 - 判断正确，直接复制输出")
             else:
                 # 如果不正确，使用正确CWE重新调用API
@@ -396,69 +399,56 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
                 if cwe_info:
                     print(f"第 {idx + 1} 条判断错误，使用正确CWE重新分析: {cwe_info}")
                     _, correct_content = analyzer.analyze_with_correct_cwe(func_body, cwe_info)
-                    df.at[idx, 'correct_output'] = correct_content
-                    print(f"二次分析完成")
+                    new_row['correct_output'] = correct_content
+                    print(f"第 {idx + 1} 条二次分析完成")
                 else:
-                    df.at[idx, 'correct_output'] = ''
+                    new_row['correct_output'] = ''
                     print(f"第 {idx + 1} 条无有效CWE信息")
             
-            print(f"原始CWE: {original_cwe}")
-            print(f"提取CWE: {extracted_cwe}")
-            print(f"DS结果: {df.at[idx, 'ds_result']}")  # 新增
-            print(f"正确性: {is_correct}")
-            print(f"思维链长度: {len(reasoning_content)} 字符")
-            print(f"正式输出: {content[:100]}..." if len(content) > 100 else f"正式输出: {content}")
+            print(f"第 {idx + 1} 条原始CWE: {original_cwe}")
+            print(f"第 {idx + 1} 条提取CWE: {extracted_cwe}")
+            print(f"第 {idx + 1} 条DS结果: {df.at[idx, 'ds_result']}")  # 新增
+            print(f"第 {idx + 1} 条正确性: {is_correct}")
+            print(f"第 {idx + 1} 条思维链长度: {len(reasoning_content)} 字符")
+            print(f"第 {idx + 1} 条正式输出: {content[:100]}..." if len(content) > 100 else f"正式输出: {content}")
             print("-" * 50)
-            
-            # 每处理batch_size条记录保存一次分片
-            if (idx + 1) % batch_size == 0:
-                chunk_num += 1
-                
-                # 保存分片文件
-                if save_chunks:
-                    chunk_filename = create_chunk_filename(output_file, chunk_num, total_chunks)
-                    # 保存当前分片的数据（从当前位置往前batch_size条）
-                    start_idx = max(0, idx + 1 - batch_size)
-                    chunk_df = df.iloc[start_idx:idx + 1].copy()
-                    save_file(chunk_df, chunk_filename)
-                    print(f"已保存分片 {chunk_num}: {chunk_filename} (记录 {start_idx + 1}-{idx + 1})")
-                
-                # 保存完整文件
-                save_file(df, output_file)
-                print(f"已保存完整进度到 {output_file}")
             
             # 添加延迟避免API限流
             time.sleep(1)
+            return new_row
             
         except Exception as e:
             print(f"处理第 {idx + 1} 条记录时出错: {e}")
-            df.at[idx, 'ds_think'] = f'处理错误: {e}'
-            df.at[idx, 'ds_output'] = ''
-            df.at[idx, 'ds_result'] = '处理错误'  # 新增
-            df.at[idx, 'is_correct'] = '×'
-            df.at[idx, 'correct_output'] = ''
+            new_row['ds_think'] = f'处理错误: {e}'
+            new_row['ds_output'] = ''
+            new_row['ds_result'] = '处理错误'  # 新增
+            new_row['is_correct'] = '×'
+            new_row['correct_output'] = ''
+            return new_row
     
-    # 保存最后一个分片（如果有剩余记录）
-    remaining_records = len(df) % batch_size
-    if save_chunks and remaining_records > 0:
-        chunk_num += 1
-        chunk_filename = create_chunk_filename(output_file, chunk_num, total_chunks)
-        start_idx = len(df) - remaining_records
-        chunk_df = df.iloc[start_idx:].copy()
-        save_file(chunk_df, chunk_filename)
-        print(f"已保存最后分片 {chunk_num}: {chunk_filename} (记录 {start_idx + 1}-{len(df)})")
+    new_df = pd.DataFrame(columns=df.columns)
+    # 多线程处理
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # 提交所有任务
+        futures = [executor.submit(get_ds_result, idx, row) for idx, row in df.iterrows()]
+        # 收集结果
+        for future in concurrent.futures.as_completed(futures):
+            new_row = future.result()
+            new_df = pd.concat([new_df, pd.DataFrame([new_row])], ignore_index=True)
+    
+    # print(new_df)
     
     # 最终保存完整文件
-    save_file(df, output_file)
+    save_file(new_df, output_file)
     print(f"处理完成！结果已保存到 {output_file}")
     
     # 统计结果
-    correct_count = (df['is_correct'] == '√').sum()
-    total_count = len(df[df['is_correct'].isin(['√', '×'])])
+    correct_count = (new_df['is_correct'] == '√').sum()
+    total_count = len(new_df[new_df['is_correct'].isin(['√', '×'])])
     accuracy = correct_count / total_count * 100 if total_count > 0 else 0
     
     print(f"\n统计结果:")
-    print(f"总记录数: {len(df)}")
+    print(f"总记录数: {len(new_df)}")
     print(f"成功处理: {total_count}")
     print(f"正确匹配: {correct_count}")
     print(f"准确率: {accuracy:.2f}%")
@@ -627,21 +617,22 @@ def resume_processing(input_file: str, output_file: str, api_key: str, batch_siz
     print(f"处理完成！结果已保存到 {output_file}")
 
 if __name__ == "__main__":
-    # 配置参数
-    INPUT_FILE = "sample_3.csv"  # 输入文件路径（支持 .csv, .xlsx, .xls）
-    OUTPUT_FILE = "output_with_analysis.csv"  # 输出文件路径
-    # API_KEY = "sk-044fb6603b7b4185b4ea6c876df52833"  # 替换为你的DeepSeek API密钥
     with open("config.json", "r") as f:
         config = json.load(f)
+    # 配置参数
+    INPUT_FILE = config["INPUT_FILE"] # 输入文件路径（支持 .csv, .xlsx, .xls）
+    OUTPUT_FILE = "output_with_analysis.csv"  # 输出文件路径
+    # API_KEY = "sk-044fb6603b7b4185b4ea6c876df52833"  # 替换为你的DeepSeek API密钥
     API_KEY = config["DEEPSEEK_API_KEY"]  # 从配置文件获取API密钥
+    MAX_WORKERS = config["MAX_WORKERS"] if "MAX_WORKERS" in config else 5  # 最大线程数，默认为5
     SHEET_NAME = None  # Excel工作表名称，None表示使用第一个工作表
     BATCH_SIZE = 5  # 每处理5条记录保存一次分片
     SAVE_CHUNKS = True  # 是否保存分片文件
     
     # 方式1: 从头开始处理
-    # process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, batch_size=BATCH_SIZE, 
-    #              sheet_name=SHEET_NAME, save_chunks=SAVE_CHUNKS)
+    process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, batch_size=BATCH_SIZE, 
+                 sheet_name=SHEET_NAME, save_chunks=SAVE_CHUNKS, max_workers=MAX_WORKERS)
     
     # 方式2: 恢复处理（推荐）- 可以从断点继续
-    resume_processing(INPUT_FILE, OUTPUT_FILE, API_KEY, batch_size=BATCH_SIZE, 
-                     sheet_name=SHEET_NAME, save_chunks=SAVE_CHUNKS)
+    # resume_processing(INPUT_FILE, OUTPUT_FILE, API_KEY, batch_size=BATCH_SIZE, 
+    #                  sheet_name=SHEET_NAME, save_chunks=SAVE_CHUNKS)
