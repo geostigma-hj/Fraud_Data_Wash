@@ -252,13 +252,6 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
                 time.sleep(5)
         
         return reduced_content
-        # 如果所有尝试都失败，返回原内容或截断
-        # if len(ds_think_content) > 1000:
-        #     print("删减失败，返回截断的原内容")
-        #     return ds_think_content[:1000] + "..."
-        # else:
-        #     print("删减失败，返回原内容")
-        #     return ds_think_content
 
     def generate_correct_output_with_retry(self, func_body: str, original_cwe: str, cve_info: str, changed_statements: str) -> str:
         """
@@ -343,7 +336,6 @@ def save_file(df: pd.DataFrame, file_path: str, **kwargs) -> None:
     ext = get_file_extension(file_path)
     
     if ext == '.csv':
-        # 默认参数，可以被kwargs覆盖
         # 解决CSV截断问题：设置CSV的最大字段大小
         import csv
         csv.field_size_limit(1000000)  # 设置为1MB
@@ -462,10 +454,6 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
     
     print(f"开始处理 {len(df)} 条记录...")
     
-    # 计算总分片数
-    # total_chunks = (len(df) + batch_size - 1) // batch_size if save_chunks else None
-    # chunk_num = 0
-    
     def get_ds_result(idx, row):
         # 先基于 row 复制一个新行出来
         new_row = row.copy()
@@ -583,16 +571,13 @@ if __name__ == "__main__":
     API_KEY = config["DEEPSEEK_API_KEY"]  # 从配置文件获取API密钥
     MAX_WORKERS = config["MAX_WORKERS"] if "MAX_WORKERS" in config else 5  # 最大线程数，默认为5
     SHEET_NAME = None  # Excel工作表名称，None表示使用第一个工作表
+
+    # 由于并行速度够快，分片处理逻辑已删除，下面两行可忽略    
     BATCH_SIZE = 5  # 每处理5条记录保存一次分片
     SAVE_CHUNKS = True  # 是否保存分片文件
     
     start_time = time.time()
-    # 方式1: 从头开始处理
     process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, batch_size=BATCH_SIZE, 
                  sheet_name=SHEET_NAME, save_chunks=SAVE_CHUNKS, max_workers=MAX_WORKERS)
-    
-    # 方式2: 恢复处理（推荐）- 可以从断点继续————代码已删除，不使用
-    # resume_processing(INPUT_FILE, OUTPUT_FILE, API_KEY, batch_size=BATCH_SIZE, 
-    #                  sheet_name=SHEET_NAME, save_chunks=SAVE_CHUNKS)
     end_time = time.time()
     print(f"处理完成！总耗时: {(end_time - start_time) / 60:.2f}分钟")
