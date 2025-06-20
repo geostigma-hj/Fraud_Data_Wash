@@ -1,0 +1,7 @@
+{
+    "INPUT_FILE": "your csv file",
+    "DEEPSEEK_API_KEY": "your_deepseek_api_key_here",
+    "BAILIAN_API_KEY": "your_bailian_api_key_here",
+    "SILICONFLOW_API_KEY": "your_siliconflow_api_key_here",
+    "MAX_WORKERS": 24
+}
