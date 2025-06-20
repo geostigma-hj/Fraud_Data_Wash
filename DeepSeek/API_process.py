@@ -64,22 +64,27 @@ class DeepSeekAnalyzer:
             print(f"API调用失败: {e}")
             return f"API调用失败: {e}", ""
     
-    def analyze_with_correct_cwe(self, func_body: str, cwe_info: str, line_statements: str = "") -> Tuple[str, str]:
+    def analyze_with_correct_cwe(self, func_body: str, cwe_info: str, cve_info: str = "", changed_statements: str = "") -> Tuple[str, str]:
         """
         使用正确的CWE信息重新分析函数漏洞
         
         Args:
             func_body: 函数体代码
             cwe_info: 正确的CWE信息
-            line_statements: 可能存在漏洞代码的区间
+            cve_info: CVE信息
+            changed_statements: 可能存在漏洞代码的区间
             
         Returns:
             tuple: (思维链reasoning_content, 正式输出结果content)
         """
+        # 构建CVE信息部分
+        cve_section = f"漏洞相关CVE编号：{cve_info}" if cve_info else ""
+        
         prompt = f"""
 {func_body}
 上述代码存在{cwe_info}漏洞，请仔细分析这段程序，找出存在漏洞的代码并分析其潜在的风险（注意不要生成修复建议等无关内容）。
-可能存在漏洞代码的区间：{line_statements}
+可能存在漏洞代码的区间：{changed_statements}
+{cve_section}
 以下是一个输出示例（仅作参考，你可以自行补充你觉得合适的内容）：
 空指针解引用风险（CWE-476）​
 问题代码​：
@@ -177,12 +182,13 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
         
         extracted_cwe_numbers = set(extracted_cwe)
         
-        # 检查是否有交集
-        return '√' if original_cwe_numbers.intersection(extracted_cwe_numbers) else '×'
+        # 检查原始信息是否完全被包含
+        # return '√' if original_cwe_numbers.intersection(extracted_cwe_numbers) else '×'
+        return '√' if all(cwe in extracted_cwe_numbers for cwe in original_cwe_numbers) else '×'
     
     def reduce_thinking_content(self, ds_think_content: str) -> str:
         """
-        对ds_think内容进行删减，保持在500-800字之间
+        对ds_think内容进行删减，保持在600-1000字之间
         
         Args:
             ds_think_content: 原始的思维链内容
@@ -190,8 +196,8 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
         Returns:
             str: 删减后的思维链内容
         """
-        if not ds_think_content or len(ds_think_content) <= 800:
-            if len(ds_think_content) >= 500:
+        if not ds_think_content or len(ds_think_content) <= 1000:
+            if len(ds_think_content) >= 600:
                 return ds_think_content
         
         # example = "我们分析给定的代码：static void willRemoveChildren(ContainerNode* container) 主要功能：移除容器节点的所有子节点。 关键点：先获取子节点列表快照，再遍历该快照。这避免了因移除节点导致容器结构变化而引起的迭代器失效问题。但我们需关注在遍历过程中，子节点被通知将要被移除（notifyMutationObserversNodeWillDetach）并触发事件（dispatchChildRemovalEvents）时，是否可能修改DOM树。 在回调中移除其他节点可能影响操作，但遍历的是快照列表，因此容器当前子节点变化不影响当前操作。然而，如果回调删除当前处理的子节点，后续操作可能访问已释放内存。 更严重的漏洞在于：通知观察者时，脚本可能对DOM进行任意修改，包括移除容器节点。如果容器节点被销毁，后续操作（如mutation.willRemoveChild(child)和ChildFrameDisconnector）将使用悬垂指针，导致UAF漏洞。 相关代码： for (...) { child->notifyMutationObserversNodeWillDetach(); // 可能触发回调，销毁container dispatchChildRemovalEvents(child); // 也存在风险 } ChildFrameDisconnector(container).disconnect(...); // 使用可能已被释放的container 结论：存在CWE-416（Use After Free）漏洞。当通知突变观察者节点将要被移除时，观察者的回调可能会销毁容器节点，导致后续操作使用已被释放的内存。 风险描述：在移除容器节点的子节点过程中，通知突变观察者可能导致容器节点被销毁，后续操作（包括循环迭代和ChildFrameDisconnector）使用已释放的container指针，引发安全漏洞。"
@@ -205,7 +211,7 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
 
 结论：存在xx漏洞（给出CWE编号）/无漏洞
 """
-        prompt = f"""{ds_think_content}\n---------------------------------------------------------\n任务要求：\n删减这段文字内容以减少其字数（切记不要添加或者总结任何内容，尽量保证原始文本的排版不变，你的任务只是做单纯的文字删减和必要的文字衔接）。 注意事项： 1. 请严格按照思维链的格式输出，体现出原始思维链中的思考过程（重点在于第一人称与探索反思），不要写成总结型内容。 2. 保证删减之后的文字连贯，不要出现生硬的截断内容，确保生成文本的结构完整性。 3. 保留核心分析内容，重复以及不重要的部分可以删除和丢弃。 4. 删减之后确保不少于500字且不要超过800个字！！！（这个很重要，一定要遵守）。\n以下是一份输出的参考格式（仅供参考，你可以自行补充你觉得合适的内容）：\n{format}"""
+        prompt = f"""{ds_think_content}\n---------------------------------------------------------\n任务要求：\n删减这段文字内容以减少其字数（切记不要添加或者总结任何内容，尽量保证原始文本的排版不变，你的任务只是做单纯的文字删减和必要的文字衔接）。 注意事项： 1. 请严格按照思维链的格式输出，体现出原始思维链中的思考过程（重点在于第一人称与探索反思），不要写成总结型内容。 2. 保证删减之后的文字连贯，不要出现生硬的截断内容，确保生成文本的结构完整性。 3. 保留核心分析内容，重复以及不重要的部分可以删除和丢弃。 4. 删减之后确保不少于600字且不要超过1000个字！！！（这个很重要，一定要遵守）。\n以下是一份输出的参考格式（仅供参考，你可以自行补充你觉得合适的内容）：\n{format}"""
         
         messages = [
             {"role": "user", "content": prompt}
@@ -225,17 +231,17 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
                 
                 # 检查字数是否符合要求
                 char_count = len(reduced_content)
-                if 500 <= char_count <= 800:
+                if 600 <= char_count <= 1000:
                     print(f"删减成功，字数: {char_count}")
                     return reduced_content
                 else:
-                    print(f"第 {attempt + 1} 次删减字数不符合要求: {char_count} 字，要求500-800字")
+                    print(f"第 {attempt + 1} 次删减字数不符合要求: {char_count} 字，要求600-1000字")
                     if attempt < max_attempts - 1:
                         # 调整prompt以提醒字数要求
-                        if char_count < 500:
-                            prompt = f"""{ds_think_content}\n---------------------------------------------------------\n任务要求：\n删减这段文字内容以减少其字数（切记不要添加或者总结任何内容，尽量保证原始文本的排版不变，你的任务只是做单纯的文字删减和必要的文字衔接）。 注意事项： 1. 请严格按照思维链的格式输出，体现出原始思维链中的思考过程（重点在于第一人称与探索反思），不要写成总结型内容。 2. 保证删减之后的文字连贯，不要出现生硬的截断内容，确保生成文本的结构完整性。 3. 保留核心分析内容，重复以及不重要的部分可以删除和丢弃。 4. 删减之后确保不少于500字且不要超过800个字！！！**当前删减过度了，需要保留更多内容以达到至少500字**。\n以下是一份输出的参考格式（仅供参考，你可以自行补充你觉得合适的内容）：\n{format}"""
+                        if char_count < 600:
+                            prompt = f"""原始思维链：\n{ds_think_content}\n删减过后的思维链：\n{reduced_content}\n---------------------------------------------------------\n任务要求：\n删减这段文字内容以减少其字数（切记不要添加或者总结任何内容，尽量保证原始文本的排版不变，你的任务只是做单纯的文字删减和必要的文字衔接）。 注意事项： 1. 请严格按照思维链的格式输出，体现出原始思维链中的思考过程（重点在于第一人称与探索反思），不要写成总结型内容。 2. 保证删减之后的文字连贯，不要出现生硬的截断内容，确保生成文本的结构完整性。 3. 保留核心分析内容，重复以及不重要的部分可以删除和丢弃。 4. 删减之后确保不少于600字且不要超过1000个字！！！**当前删减过度了，需要保留更多内容以达到至少600字**。\n以下是一份输出的参考格式（仅供参考，你可以自行补充你觉得合适的内容）：\n{format}"""
                         else:
-                            prompt = f"""{ds_think_content}\n---------------------------------------------------------\n任务要求：\n删减这段文字内容以减少其字数（切记不要添加或者总结任何内容，尽量保证原始文本的排版不变，你的任务只是做单纯的文字删减和必要的文字衔接）。 注意事项： 1. 请严格按照思维链的格式输出，体现出原始思维链中的思考过程（重点在于第一人称与探索反思），不要写成总结型内容。 2. 保证删减之后的文字连贯，不要出现生硬的截断内容，确保生成文本的结构完整性。 3. 保留核心分析内容，重复以及不重要的部分可以删除和丢弃。 4. 删减之后确保不少于500字且不要超过800个字！！！**当前删减不够，需要进一步删减以控制在800字以内**。\n以下是一份输出的参考格式（仅供参考，你可以自行补充你觉得合适的内容）：\n{format}"""
+                            prompt = f"""原始思维链：\n{ds_think_content}\n删减过后的思维链：\n{reduced_content}\n---------------------------------------------------------\n任务要求：\n删减这段文字内容以减少其字数（切记不要添加或者总结任何内容，尽量保证原始文本的排版不变，你的任务只是做单纯的文字删减和必要的文字衔接）。 注意事项： 1. 请严格按照思维链的格式输出，体现出原始思维链中的思考过程（重点在于第一人称与探索反思），不要写成总结型内容。 2. 保证删减之后的文字连贯，不要出现生硬的截断内容，确保生成文本的结构完整性。 3. 保留核心分析内容，重复以及不重要的部分可以删除和丢弃。 4. 删减之后确保不少于600字且不要超过1000个字！！！**当前删减不够，需要进一步删减以控制在1000字以内**。\n以下是一份输出的参考格式（仅供参考，你可以自行补充你觉得合适的内容）：\n{format}"""
                         messages = [{"role": "user", "content": prompt}]
                         time.sleep(1)  # 添加延迟
                 
@@ -247,12 +253,54 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
         
         return reduced_content
         # 如果所有尝试都失败，返回原内容或截断
-        # if len(ds_think_content) > 800:
+        # if len(ds_think_content) > 1000:
         #     print("删减失败，返回截断的原内容")
-        #     return ds_think_content[:800] + "..."
+        #     return ds_think_content[:1000] + "..."
         # else:
         #     print("删减失败，返回原内容")
         #     return ds_think_content
+
+    def generate_correct_output_with_retry(self, func_body: str, original_cwe: str, cve_info: str, changed_statements: str) -> str:
+        """
+        生成correct_output并进行验证，如果需要则重试一次
+        
+        Args:
+            func_body: 函数体代码
+            original_cwe: 原始CWE信息
+            cve_info: CVE信息
+            changed_statements: 可能存在漏洞代码的区间
+            
+        Returns:
+            str: 最终的correct_output内容
+        """
+        cwe_info = format_cwe_info(original_cwe)
+        if not cwe_info:
+            return ''
+        
+        # 检查是否为"NVD-CWE-noinfo"，如果是则不需要验证
+        is_no_info = "NVD-CWE-noinfo" in original_cwe or "noinfo" in original_cwe.lower()
+        
+        # 第一次生成
+        _, correct_content = self.analyze_with_correct_cwe(func_body, cwe_info, cve_info, changed_statements)
+        
+        # 如果是noinfo或者验证通过，直接返回
+        if is_no_info:
+            print("CWE为noinfo类型，无需验证，直接使用生成结果")
+            return correct_content
+        
+        # 验证生成的内容是否包含正确的CWE
+        extracted_cwe = self.extract_cwe_from_output(correct_content)
+        is_correct = self.check_cwe_correctness(original_cwe, extracted_cwe)
+        
+        if is_correct == '√':
+            print("生成的correct_output验证通过")
+            return correct_content
+        else:
+            print("生成的correct_output验证失败，重试一次...")
+            # 重试一次
+            _, retry_content = self.analyze_with_correct_cwe(func_body, cwe_info, cve_info, changed_statements)
+            print("重试完成")
+            return retry_content
 
 def get_file_extension(file_path: str) -> str:
     return os.path.splitext(file_path)[1].lower()
@@ -405,7 +453,7 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
     df = read_file(input_file, **read_kwargs)
     
     # 检查必需的列
-    required_columns = ['func_body', 'cwe']
+    required_columns = ['func_body', 'cwe_list']
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         raise ValueError(f"缺少必需的列: {missing_columns}")
@@ -463,7 +511,7 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
             extracted_cwe = analyzer.extract_cwe_from_output(content)
             new_row['ds_result'] = format_cwe_result(extracted_cwe)  # 新增
             
-            original_cwe = row['cwe']
+            original_cwe = row['cwe_list']
             is_correct = analyzer.check_cwe_correctness(original_cwe, extracted_cwe)
             new_row['is_correct'] = is_correct
             
@@ -477,8 +525,9 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
                 cwe_info = format_cwe_info(original_cwe)
                 if cwe_info:
                     print(f"第 {idx + 1} 条判断错误，使用正确CWE重新分析: {cwe_info}")
-                    line_statements = row.get('line_statements', '')  # 获取line_statements字段，默认为空
-                    _, correct_content = analyzer.analyze_with_correct_cwe(func_body, cwe_info, line_statements)
+                    changed_statements = row.get('changed_statements', '')  # 获取changed_statements字段，默认为空
+                    cve_list = row.get('cve_list', '')  # 获取cve_list字段，默认为空
+                    correct_content = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
                     new_row['correct_output'] = correct_content
                     print(f"第 {idx + 1} 条二次分析完成")
                 else:
@@ -518,7 +567,7 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
     
     new_df = pd.DataFrame(columns=df.columns)
     # 多线程处理
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
         futures = [executor.submit(get_ds_result, idx, row) for idx, row in df.iterrows()]
         # 收集结果
@@ -577,7 +626,7 @@ def resume_processing(input_file: str, output_file: str, api_key: str, batch_siz
         print(f"输出文件不存在，从头开始处理...")
     
     # 检查必需的列
-    required_columns = ['func_body', 'cwe']
+    required_columns = ['func_body', 'cwe_list']
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         raise ValueError(f"缺少必需的列: {missing_columns}")
@@ -636,7 +685,7 @@ def resume_processing(input_file: str, output_file: str, api_key: str, batch_siz
                 # 提取CWE并检查正确性
                 extracted_cwe = analyzer.extract_cwe_from_output(content)
                 df.at[idx, 'ds_result'] = format_cwe_result(extracted_cwe)  # 新增
-                original_cwe = row['cwe']
+                original_cwe = row['cwe_list']
                 is_correct = analyzer.check_cwe_correctness(original_cwe, extracted_cwe)
                 df.at[idx, 'is_correct'] = is_correct
             else:
@@ -657,12 +706,13 @@ def resume_processing(input_file: str, output_file: str, api_key: str, batch_siz
                     print(f"判断正确，直接复制输出")
                 else:
                     # 如果不正确，使用正确CWE重新调用API
-                    original_cwe = row['cwe']
+                    original_cwe = row['cwe_list']
                     cwe_info = format_cwe_info(original_cwe)
                     if cwe_info:
                         print(f"判断错误，使用正确CWE重新分析: {cwe_info}")
-                        line_statements = row.get('line_statements', '')  # 获取line_statements字段，默认为空
-                        _, correct_content = analyzer.analyze_with_correct_cwe(func_body, cwe_info, line_statements)
+                        changed_statements = row.get('changed_statements', '')  # 获取changed_statements字段，默认为空
+                        cve_list = row.get('cve_list', '')  # 获取cve_list字段，默认为空
+                        correct_content = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
                         df.at[idx, 'correct_output'] = correct_content
                         print(f"二次分析完成")
                     else:
@@ -730,13 +780,13 @@ if __name__ == "__main__":
     # 配置参数
     INPUT_FILE = config["INPUT_FILE"] # 输入文件路径（支持 .csv, .xlsx, .xls）
     OUTPUT_FILE = "output_with_analysis.csv"  # 输出文件路径
-    # API_KEY = "sk-044fb6603b7b4185b4ea6c876df52833"  # 替换为你的DeepSeek API密钥
     API_KEY = config["DEEPSEEK_API_KEY"]  # 从配置文件获取API密钥
     MAX_WORKERS = config["MAX_WORKERS"] if "MAX_WORKERS" in config else 5  # 最大线程数，默认为5
     SHEET_NAME = None  # Excel工作表名称，None表示使用第一个工作表
     BATCH_SIZE = 5  # 每处理5条记录保存一次分片
     SAVE_CHUNKS = True  # 是否保存分片文件
     
+    start_time = time.time()
     # 方式1: 从头开始处理
     process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, batch_size=BATCH_SIZE, 
                  sheet_name=SHEET_NAME, save_chunks=SAVE_CHUNKS, max_workers=MAX_WORKERS)
@@ -744,3 +794,7 @@ if __name__ == "__main__":
     # 方式2: 恢复处理（推荐）- 可以从断点继续
     # resume_processing(INPUT_FILE, OUTPUT_FILE, API_KEY, batch_size=BATCH_SIZE, 
     #                  sheet_name=SHEET_NAME, save_chunks=SAVE_CHUNKS)
+    end_time = time.time()
+    print(f"处理完成！总耗时: {(end_time - start_time) / 60:.2f}分钟")
+
+    
