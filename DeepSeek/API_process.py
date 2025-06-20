@@ -409,24 +409,6 @@ def format_cwe_result(cwe_list: list) -> str:
     else:
         return ", ".join(cwe_list)
 
-def create_chunk_filename(base_filename: str, chunk_num: int, total_chunks: int = None) -> str:
-    """
-    创建分片文件名
-    
-    Args:
-        base_filename: 基础文件名，如 "output.xlsx"
-        chunk_num: 分片编号（从1开始）
-        total_chunks: 总分片数（可选）
-        
-    Returns:
-        str: 分片文件名，如 "output_chunk_1.xlsx"
-    """
-    name, ext = os.path.splitext(base_filename)
-    if total_chunks:
-        return f"{name}_chunk_{chunk_num:03d}_of_{total_chunks:03d}{ext}"
-    else:
-        return f"{name}_chunk_{chunk_num:03d}{ext}"
-
 def process_file(input_file: str, output_file: str, api_key: str, batch_size: int = 5, 
                 sheet_name: str = None, save_chunks: bool = True, max_workers: int=5, **file_kwargs):
     """
@@ -481,8 +463,8 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
     print(f"开始处理 {len(df)} 条记录...")
     
     # 计算总分片数
-    total_chunks = (len(df) + batch_size - 1) // batch_size if save_chunks else None
-    chunk_num = 0
+    # total_chunks = (len(df) + batch_size - 1) // batch_size if save_chunks else None
+    # chunk_num = 0
     
     def get_ds_result(idx, row):
         # 先基于 row 复制一个新行出来
@@ -592,194 +574,12 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
     print(f"正确匹配: {correct_count}")
     print(f"准确率: {accuracy:.2f}%")
 
-def resume_processing(input_file: str, output_file: str, api_key: str, batch_size: int = 5,
-                     sheet_name: str = None, save_chunks: bool = True, **file_kwargs):
-    """
-    恢复处理（从已有的输出文件继续处理未完成的部分）
-    
-    Args:
-        input_file: 输入文件路径
-        output_file: 输出文件路径（如果存在会继续处理）
-        api_key: DeepSeek API密钥
-        batch_size: 批处理大小
-        sheet_name: Excel工作表名称（仅对xlsx文件有效）
-        save_chunks: 是否保存分片文件
-        **file_kwargs: 传递给文件读取函数的额外参数
-    """
-    try:
-        # 尝试读取已有的输出文件
-        df = read_file(output_file)
-        print(f"找到已有输出文件，从断点继续处理...")
-    except FileNotFoundError:
-        # 如果输出文件不存在，从头开始
-        read_kwargs = file_kwargs.copy()
-        if sheet_name and get_file_extension(input_file) in ['.xlsx', '.xls']:
-            read_kwargs['sheet_name'] = sheet_name
-        
-        df = read_file(input_file, **read_kwargs)
-        df['ds_think'] = ''
-        df['ds_output'] = ''
-        df['ds_result'] = ''  # 新增
-        df['is_correct'] = ''
-        df['correct_output'] = ''
-        df['ds_think_reduced'] = ''  # 新增删减后的思维链列
-        print(f"输出文件不存在，从头开始处理...")
-    
-    # 检查必需的列
-    required_columns = ['func_body', 'cwe_list']
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    if missing_columns:
-        raise ValueError(f"缺少必需的列: {missing_columns}")
-    
-    # 确保所有必需列存在
-    if 'correct_output' not in df.columns:
-        df['correct_output'] = ''
-    if 'ds_result' not in df.columns:  # 新增
-        df['ds_result'] = ''
-    if 'ds_think_reduced' not in df.columns:  # 新增删减后的思维链列
-        df['ds_think_reduced'] = ''
-    
-    # 初始化分析器
-    analyzer = DeepSeekAnalyzer(api_key)
-    
-    # 找到未处理的记录
-    unprocessed_mask = (
-        (df['ds_think'] == '') | (df['ds_think'].isna()) | 
-        (df['correct_output'] == '') | (df['correct_output'].isna()) |
-        (df['ds_result'] == '') | (df['ds_result'].isna()) |  # 新增条件
-        (df['ds_think_reduced'] == '') | (df['ds_think_reduced'].isna())  # 新增思维链删减条件
-    )
-    unprocessed_indices = df[unprocessed_mask].index.tolist()
-    
-    if not unprocessed_indices:
-        print("所有记录都已处理完成！")
-        return
-    
-    print(f"发现 {len(unprocessed_indices)} 条未完全处理记录，继续处理...")
-    
-    # 计算分片信息
-    total_chunks = (len(unprocessed_indices) + batch_size - 1) // batch_size if save_chunks else None
-    chunk_num = 0
-    
-    for i, idx in enumerate(unprocessed_indices):
-        try:
-            row = df.loc[idx]
-            print(f"处理第 {i + 1}/{len(unprocessed_indices)} 条未处理记录 (总第 {idx + 1} 条)...")
-            
-            func_body = row['func_body']
-            if pd.isna(func_body) or func_body == '':
-                df.at[idx, 'ds_think'] = '函数体为空'
-                df.at[idx, 'ds_output'] = ''
-                df.at[idx, 'ds_result'] = '无漏洞'  # 新增
-                df.at[idx, 'is_correct'] = '×'
-                df.at[idx, 'correct_output'] = ''
-                df.at[idx, 'ds_think_reduced'] = ''  # 新增
-                continue
-            
-            # 如果ds_think为空，进行初次分析
-            if pd.isna(df.at[idx, 'ds_think']) or df.at[idx, 'ds_think'] == '':
-                reasoning_content, content = analyzer.analyze_function(func_body)
-                df.at[idx, 'ds_think'] = reasoning_content
-                df.at[idx, 'ds_output'] = content
-                
-                # 提取CWE并检查正确性
-                extracted_cwe = analyzer.extract_cwe_from_output(content)
-                df.at[idx, 'ds_result'] = format_cwe_result(extracted_cwe)  # 新增
-                original_cwe = row['cwe_list']
-                is_correct = analyzer.check_cwe_correctness(original_cwe, extracted_cwe)
-                df.at[idx, 'is_correct'] = is_correct
-            else:
-                # 如果已有初次分析结果，获取正确性判断
-                is_correct = df.at[idx, 'is_correct']
-                content = df.at[idx, 'ds_output']
-                
-                # 检查ds_result是否为空，如果为空则重新提取
-                if pd.isna(df.at[idx, 'ds_result']) or df.at[idx, 'ds_result'] == '':
-                    extracted_cwe = analyzer.extract_cwe_from_output(content)
-                    df.at[idx, 'ds_result'] = format_cwe_result(extracted_cwe)
-            
-            # 如果correct_output为空，根据正确性处理
-            if pd.isna(df.at[idx, 'correct_output']) or df.at[idx, 'correct_output'] == '':
-                if is_correct == '√':
-                    # 如果正确，直接复制ds_output到correct_output
-                    df.at[idx, 'correct_output'] = content
-                    print(f"判断正确，直接复制输出")
-                else:
-                    # 如果不正确，使用正确CWE重新调用API
-                    original_cwe = row['cwe_list']
-                    cwe_info = format_cwe_info(original_cwe)
-                    if cwe_info:
-                        print(f"判断错误，使用正确CWE重新分析: {cwe_info}")
-                        changed_statements = row.get('changed_statements', '')  # 获取changed_statements字段，默认为空
-                        cve_list = row.get('cve_list', '')  # 获取cve_list字段，默认为空
-                        correct_content = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
-                        df.at[idx, 'correct_output'] = correct_content
-                        print(f"二次分析完成")
-                    else:
-                        df.at[idx, 'correct_output'] = ''
-                        print(f"无有效CWE信息")
-            
-            # 如果ds_think_reduced为空，进行删减处理
-            if pd.isna(df.at[idx, 'ds_think_reduced']) or df.at[idx, 'ds_think_reduced'] == '':
-                ds_think_content = df.at[idx, 'ds_think']
-                if ds_think_content and not pd.isna(ds_think_content) and ds_think_content != '':
-                    print(f"正在删减思维链内容，原长度: {len(ds_think_content)} 字符")
-                    reduced_thinking = analyzer.reduce_thinking_content(ds_think_content)
-                    df.at[idx, 'ds_think_reduced'] = reduced_thinking
-                    print(f"思维链删减完成，新长度: {len(reduced_thinking)} 字符")
-                else:
-                    df.at[idx, 'ds_think_reduced'] = ''
-            
-            print(f"处理完成 - 正确性: {is_correct}, DS结果: {df.at[idx, 'ds_result']}")
-            
-            # 每处理batch_size条记录保存一次分片
-            if (i + 1) % batch_size == 0:
-                chunk_num += 1
-                
-                if save_chunks:
-                    chunk_filename = create_chunk_filename(output_file, chunk_num, total_chunks)
-                    # 获取当前批次处理的记录
-                    current_batch_indices = unprocessed_indices[max(0, i + 1 - batch_size):i + 1]
-                    chunk_df = df.loc[current_batch_indices].copy()
-                    save_file(chunk_df, chunk_filename)
-                    print(f"已保存处理分片 {chunk_num}: {chunk_filename}")
-                
-                save_file(df, output_file)
-                print(f"已保存进度到 {output_file}")
-            
-            # 添加延迟避免API限流
-            time.sleep(1)
-            
-        except Exception as e:
-            print(f"处理第 {idx + 1} 条记录时出错: {e}")
-            df.at[idx, 'ds_think'] = f'处理错误: {e}'
-            df.at[idx, 'ds_output'] = ''
-            df.at[idx, 'ds_result'] = '处理错误'  # 新增
-            df.at[idx, 'is_correct'] = '×'
-            df.at[idx, 'correct_output'] = ''
-            df.at[idx, 'ds_think_reduced'] = ''  # 新增
-    
-    # 保存最后一个分片（如果有剩余记录）
-    remaining_records = len(unprocessed_indices) % batch_size
-    if save_chunks and remaining_records > 0:
-        chunk_num += 1
-        chunk_filename = create_chunk_filename(output_file, chunk_num, total_chunks)
-        start_idx = len(unprocessed_indices) - remaining_records
-        remaining_indices = unprocessed_indices[start_idx:]
-        chunk_df = df.loc[remaining_indices].copy()
-        save_file(chunk_df, chunk_filename)
-        print(f"已保存最后处理分片 {chunk_num}: {chunk_filename}")
-    
-    # 最终保存
-    save_file(df, output_file)
-    print(f"处理完成！结果已保存到 {output_file}")
-
 if __name__ == "__main__":
     with open("config.json", "r") as f:
         config = json.load(f)
     # 配置参数
     INPUT_FILE = config["INPUT_FILE"] # 输入文件路径（支持 .csv, .xlsx, .xls）
-    OUTPUT_FILE = "output_with_analysis.csv"  # 输出文件路径
+    OUTPUT_FILE = "output_with_analysis2.csv"  # 输出文件路径
     API_KEY = config["DEEPSEEK_API_KEY"]  # 从配置文件获取API密钥
     MAX_WORKERS = config["MAX_WORKERS"] if "MAX_WORKERS" in config else 5  # 最大线程数，默认为5
     SHEET_NAME = None  # Excel工作表名称，None表示使用第一个工作表
@@ -791,10 +591,8 @@ if __name__ == "__main__":
     process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, batch_size=BATCH_SIZE, 
                  sheet_name=SHEET_NAME, save_chunks=SAVE_CHUNKS, max_workers=MAX_WORKERS)
     
-    # 方式2: 恢复处理（推荐）- 可以从断点继续
+    # 方式2: 恢复处理（推荐）- 可以从断点继续————代码已删除，不使用
     # resume_processing(INPUT_FILE, OUTPUT_FILE, API_KEY, batch_size=BATCH_SIZE, 
     #                  sheet_name=SHEET_NAME, save_chunks=SAVE_CHUNKS)
     end_time = time.time()
     print(f"处理完成！总耗时: {(end_time - start_time) / 60:.2f}分钟")
-
-    
