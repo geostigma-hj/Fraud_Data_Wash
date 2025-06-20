@@ -579,7 +579,7 @@ if __name__ == "__main__":
         config = json.load(f)
     # 配置参数
     INPUT_FILE = config["INPUT_FILE"] # 输入文件路径（支持 .csv, .xlsx, .xls）
-    OUTPUT_FILE = "output_with_analysis2.csv"  # 输出文件路径
+    OUTPUT_FILE = "output_with_analysis.csv"  # 输出文件路径
     API_KEY = config["DEEPSEEK_API_KEY"]  # 从配置文件获取API密钥
     MAX_WORKERS = config["MAX_WORKERS"] if "MAX_WORKERS" in config else 5  # 最大线程数，默认为5
     SHEET_NAME = None  # Excel工作表名称，None表示使用第一个工作表
