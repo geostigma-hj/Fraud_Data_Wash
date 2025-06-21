@@ -83,8 +83,11 @@ class DeepSeekAnalyzer:
         prompt = f"""
 {func_body}
 上述代码存在{cwe_info}漏洞，请仔细分析这段程序，找出存在漏洞的代码并分析其潜在的风险（注意不要生成修复建议等无关内容）。
-可能存在漏洞代码的区间：{changed_statements}
+可能存在漏洞的代码区间：{changed_statements}
 {cve_section}
+
+**注意：原始代码中明确存在{cwe_info}漏洞，因此请仔细分析上述代码和我提供的漏洞代码区间信息，不要输出无漏洞或者其他类型的CWE漏洞分析结果。**
+
 以下是一个输出示例（仅作参考，你可以自行补充你觉得合适的内容）：
 空指针解引用风险（CWE-476）​
 问题代码​：
@@ -127,6 +130,22 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
         if not output:
             return []
         
+        # 首先检查是否明确表示无漏洞
+        no_vuln_patterns = [
+            r'无漏洞',
+            r'未发现.*?漏洞',
+            r'不存在.*?漏洞',
+            r'没有.*?漏洞',
+            r'结论.*?无漏洞',
+            r'结论.*?未发现.*?漏洞',
+            r'结论.*?不存在.*?漏洞'
+        ]
+        
+        for pattern in no_vuln_patterns:
+            if re.search(pattern, output, re.IGNORECASE):
+                print(f"检测到无漏洞结论，忽略文本中的CWE编号")
+                return []
+        
         try:
             # 尝试解析JSON
             data = json.loads(output)
@@ -147,7 +166,17 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
         except json.JSONDecodeError:
             # 如果JSON解析失败，尝试正则表达式提取并去重
             cwe_pattern = r'CWE-\d+'
-            return list(set(re.findall(cwe_pattern, output)))
+            extracted_cwes = list(set(re.findall(cwe_pattern, output)))
+            
+            # 再次检查是否有明确的无漏洞结论
+            # 如果有CWE编号但结论是无漏洞，则返回空列表
+            if extracted_cwes:
+                for pattern in no_vuln_patterns:
+                    if re.search(pattern, output, re.IGNORECASE):
+                        print(f"虽然提到了CWE编号{extracted_cwes}，但结论是无漏洞")
+                        return []
+            
+            return extracted_cwes
         
         return []
     
@@ -289,10 +318,19 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
             print("生成的correct_output验证通过")
             return correct_content
         else:
-            print("生成的correct_output验证失败，重试一次...")
-            # 重试一次
-            _, retry_content = self.analyze_with_correct_cwe(func_body, cwe_info, cve_info, changed_statements)
-            print("重试完成")
+            # 如果验证失败，则重试2次
+            for retry_cnt in range(2):
+                print(f"生成的correct_output验证失败，重试第{retry_cnt+1}次...")
+                _, retry_content = self.analyze_with_correct_cwe(func_body, cwe_info, cve_info, changed_statements)
+                
+                extracted_cwe = self.extract_cwe_from_output(retry_content)
+                is_correct = self.check_cwe_correctness(original_cwe, extracted_cwe)
+                
+                if is_correct == '√':
+                    print("重试完成")
+                    return retry_content
+                else:
+                    print(f"第{retry_cnt+1}次重试失败")
             return retry_content
 
 def get_file_extension(file_path: str) -> str:
@@ -401,8 +439,130 @@ def format_cwe_result(cwe_list: list) -> str:
     else:
         return ", ".join(cwe_list)
 
-def process_file(input_file: str, output_file: str, api_key: str, batch_size: int = 5, 
-                sheet_name: str = None, save_chunks: bool = True, max_workers: int=5, **file_kwargs):
+def post_process_missing_rows(output_file: str, api_key: str, max_workers: int = 5):
+    """
+    后处理：检查输出文件中的缺失行并重新处理
+    
+    Args:
+        output_file: 输出文件路径
+        api_key: DeepSeek API密钥
+        max_workers: 最大线程数
+    """
+    print(f"\n开始后处理检查: {output_file}")
+    
+    # 读取输出文件
+    df = read_file(output_file)
+    
+    # 检查需要的六个列
+    required_columns = ['ds_think', 'ds_output', 'ds_result', 'is_correct', 'correct_output', 'ds_think_reduced']
+    
+    # 找出有缺失值的行
+    missing_rows = []
+    for idx, row in df.iterrows():
+        is_missing = False
+        for col in required_columns:
+            if col not in df.columns or pd.isna(row[col]) or row[col] == '' or str(row[col]).strip() == '':
+                is_missing = True
+                break
+        if is_missing:
+            missing_rows.append(idx)
+    
+    if not missing_rows:
+        print("所有行都已完整处理，无需后处理")
+        return
+    
+    print(f"发现 {len(missing_rows)} 行需要重新处理: {missing_rows}")
+    
+    # 初始化分析器
+    analyzer = DeepSeekAnalyzer(api_key)
+    
+    def process_missing_row(idx):
+        """处理单个缺失行"""
+        row = df.loc[idx].copy()
+        try:
+            print(f"重新处理第 {idx} 行...")
+            
+            func_body = row['func_body']
+            if pd.isna(func_body) or func_body == '':
+                row['ds_think'] = '函数体为空'
+                row['ds_output'] = ''
+                row['ds_result'] = '无漏洞'
+                row['is_correct'] = '×'
+                row['correct_output'] = ''
+                row['ds_think_reduced'] = ''
+                return idx, row
+            
+            # 调用API分析
+            reasoning_content, content = analyzer.analyze_function(func_body)
+            
+            # 存储结果
+            row['ds_think'] = reasoning_content
+            row['ds_output'] = content
+            
+            # 提取CWE并检查正确性
+            extracted_cwe = analyzer.extract_cwe_from_output(content)
+            row['ds_result'] = format_cwe_result(extracted_cwe)
+            
+            original_cwe = row['cwe_list']
+            is_correct = analyzer.check_cwe_correctness(original_cwe, extracted_cwe)
+            row['is_correct'] = is_correct
+            
+            # 根据正确性处理correct_output
+            if is_correct == '√':
+                row['correct_output'] = content
+                print(f"第 {idx} 行处理完成 - 判断正确")
+            else:
+                cwe_info = format_cwe_info(original_cwe)
+                if cwe_info:
+                    print(f"第 {idx} 行判断错误，使用正确CWE重新分析: {cwe_info}")
+                    changed_statements = row.get('changed_statements', '')
+                    cve_list = row.get('cve_list', '')
+                    correct_content = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
+                    row['correct_output'] = correct_content
+                    print(f"第 {idx} 行二次分析完成")
+                else:
+                    row['correct_output'] = ''
+                    print(f"第 {idx} 行无有效CWE信息")
+            
+            # 对ds_think进行删减处理
+            if reasoning_content:
+                print(f"第 {idx} 行正在删减思维链内容，原长度: {len(reasoning_content)} 字符")
+                reduced_thinking = analyzer.reduce_thinking_content(reasoning_content)
+                row['ds_think_reduced'] = reduced_thinking
+                print(f"第 {idx} 行思维链删减完成，新长度: {len(reduced_thinking)} 字符")
+            else:
+                row['ds_think_reduced'] = ''
+            
+            print(f"第 {idx} 行重新处理完成")
+            time.sleep(1)  # 添加延迟避免API限流
+            return idx, row
+            
+        except Exception as e:
+            print(f"重新处理第 {idx} 行时出错: {e}")
+            row['ds_think'] = f'处理错误: {e}'
+            row['ds_output'] = ''
+            row['ds_result'] = '处理错误'
+            row['is_correct'] = '×'
+            row['correct_output'] = ''
+            row['ds_think_reduced'] = ''
+            return idx, row
+    
+    # 多线程处理缺失行
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_missing_row, idx) for idx in missing_rows]
+        
+        for future in concurrent.futures.as_completed(futures):
+            idx, updated_row = future.result()
+            # 更新原DataFrame
+            for col in required_columns:
+                df.at[idx, col] = updated_row[col]
+    
+    # 保存更新后的文件
+    save_file(df, output_file)
+    print(f"后处理完成！已更新 {len(missing_rows)} 行，结果保存到 {output_file}")
+
+def process_file(input_file: str, output_file: str, api_key: str,
+                sheet_name: str = None, max_workers: int=5, **file_kwargs):
     """
     处理文件（支持CSV和XLSX）
     
@@ -410,7 +570,7 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
         input_file: 输入文件路径
         output_file: 输出文件路径
         api_key: DeepSeek API密钥
-        batch_size: 批处理大小，每处理这么多条记录就保存一次分片
+        batch_size: 批处理大小，每处理这么多条记录就保存一次分片（已弃用）
         sheet_name: Excel工作表名称（仅对xlsx文件有效）
         save_chunks: 是否保存分片文件
         **file_kwargs: 传递给文件读取函数的额外参数
@@ -435,40 +595,77 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
     print(f"文件读取成功，共 {len(df)} 行数据")
     print(f"列名: {list(df.columns)}")
     
+    # 预检查：检查必要列是否完整
+    required_input_columns = ['func_body', 'changed_statements', 'cve_list', 'cwe_list']
+    print(f"开始预检查必要列: {required_input_columns}")
+    
+    valid_rows = []
+    invalid_rows = []
+    
+    for idx, row in df.iterrows():
+        is_valid = True
+        missing_info = []
+        
+        for col in required_input_columns:
+            if col not in df.columns:
+                is_valid = False
+                missing_info.append(f"缺少列'{col}'")
+            elif pd.isna(row[col]) or str(row[col]).strip() == '':
+                is_valid = False
+                missing_info.append(f"列'{col}'为空")
+        
+        if is_valid:
+            valid_rows.append(idx)
+        else:
+            invalid_row = row.copy()
+            invalid_row['skip_reason'] = "; ".join(missing_info)
+            invalid_rows.append(invalid_row)
+    
+    print(f"预检查完成: 有效行 {len(valid_rows)} 行, 无效行 {len(invalid_rows)} 行")
+    
+    # 保存无效行到 fail.csv
+    if invalid_rows:
+        fail_df = pd.DataFrame(invalid_rows)
+        fail_file = output_file.replace('.csv', '_fail.csv').replace('.xlsx', '_fail.csv').replace('.xls', '_fail.csv')
+        save_file(fail_df, fail_file)
+        print(f"已将 {len(invalid_rows)} 行无效数据保存到: {fail_file}")
+    
+    # 只处理有效行
+    if not valid_rows:
+        print("没有有效的行可以处理！")
+        return
+    
+    # 筛选出有效行进行处理
+    df_valid = df.loc[valid_rows].copy()
+    print(f"开始处理 {len(df_valid)} 条有效记录...")
+    
     # 初始化分析器
     analyzer = DeepSeekAnalyzer(api_key)
     
     # 添加新列（如果不存在）
-    if 'ds_think' not in df.columns:
-        df['ds_think'] = ''
-    if 'ds_output' not in df.columns:
-        df['ds_output'] = ''
-    if 'ds_result' not in df.columns:  # 新增列
-        df['ds_result'] = ''
-    if 'is_correct' not in df.columns:
-        df['is_correct'] = ''
-    if 'correct_output' not in df.columns:
-        df['correct_output'] = ''
-    if 'ds_think_reduced' not in df.columns:  # 新增删减后的思维链列
-        df['ds_think_reduced'] = ''
-    
-    print(f"开始处理 {len(df)} 条记录...")
-    
+    if 'ds_think' not in df_valid.columns:
+        df_valid['ds_think'] = ''
+    if 'ds_output' not in df_valid.columns:
+        df_valid['ds_output'] = ''
+    if 'ds_result' not in df_valid.columns:  # 新增列
+        df_valid['ds_result'] = ''
+    if 'is_correct' not in df_valid.columns:
+        df_valid['is_correct'] = ''
+    if 'correct_output' not in df_valid.columns:
+        df_valid['correct_output'] = ''
+    if 'ds_think_reduced' not in df_valid.columns:  # 新增删减后的思维链列
+        df_valid['ds_think_reduced'] = ''
+
     def get_ds_result(idx, row):
         # 先基于 row 复制一个新行出来
         new_row = row.copy()
         try:
-            print(f"处理第 {idx + 1}/{len(df)} 条记录...")
+            # 找到在原始df_valid中的实际位置
+            actual_idx = df_valid.index.get_loc(idx)
+            print(f"处理第 {actual_idx + 1}/{len(df_valid)} 条记录...")
             
+            # 预检查已确保func_body不为空，此检查已不需要
             func_body = new_row['func_body']
-            if pd.isna(func_body) or func_body == '':
-                new_row['ds_think'] = '函数体为空'
-                new_row['ds_output'] = ''
-                new_row['ds_result'] = '无漏洞'  # 新增
-                new_row['is_correct'] = '×'
-                new_row['correct_output'] = ''
-                new_row['ds_think_reduced'] = ''  # 新增
-                return new_row
             
             # 调用API分析
             reasoning_content, content = analyzer.analyze_function(func_body)
@@ -489,36 +686,37 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
             if is_correct == '√':
                 # 如果正确，直接复制ds_output到correct_output
                 new_row['correct_output'] = content
-                print(f"第 {idx + 1} 条处理完成 - 判断正确，直接复制输出")
+                print(f"第 {actual_idx + 1} 条处理完成 - 判断正确，直接复制输出")
             else:
                 # 如果不正确，使用正确CWE重新调用API
                 cwe_info = format_cwe_info(original_cwe)
                 if cwe_info:
-                    print(f"第 {idx + 1} 条判断错误，使用正确CWE重新分析: {cwe_info}")
+                    print(f"第 {actual_idx + 1} 条判断错误，使用正确CWE重新分析: {cwe_info}")
                     changed_statements = row.get('changed_statements', '')  # 获取changed_statements字段，默认为空
                     cve_list = row.get('cve_list', '')  # 获取cve_list字段，默认为空
                     correct_content = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
                     new_row['correct_output'] = correct_content
-                    print(f"第 {idx + 1} 条二次分析完成")
+                    print(f"第 {actual_idx + 1} 条二次分析完成")
                 else:
                     new_row['correct_output'] = ''
-                    print(f"第 {idx + 1} 条无有效CWE信息")
+                    print(f"第 {actual_idx + 1} 条无有效CWE信息")
             
             # 对ds_think进行删减处理
             if reasoning_content:
-                print(f"第 {idx + 1} 条正在删减思维链内容，原长度: {len(reasoning_content)} 字符")
+                print(f"第 {actual_idx + 1} 条正在删减思维链内容，原长度: {len(reasoning_content)} 字符")
                 reduced_thinking = analyzer.reduce_thinking_content(reasoning_content)
                 new_row['ds_think_reduced'] = reduced_thinking
-                print(f"第 {idx + 1} 条思维链删减完成，新长度: {len(reduced_thinking)} 字符")
+                print(f"第 {actual_idx + 1} 条思维链删减完成，新长度: {len(reduced_thinking)} 字符")
             else:
                 new_row['ds_think_reduced'] = ''
             
-            print(f"第 {idx + 1} 条原始CWE: {original_cwe}")
-            print(f"第 {idx + 1} 条提取CWE: {extracted_cwe}")
-            print(f"第 {idx + 1} 条DS结果: {df.at[idx, 'ds_result']}")  # 新增
-            print(f"第 {idx + 1} 条正确性: {is_correct}")
-            print(f"第 {idx + 1} 条思维链长度: {len(reasoning_content)} 字符")
-            print(f"第 {idx + 1} 条正式输出: {content[:100]}..." if len(content) > 100 else f"正式输出: {content}")
+            actual_idx = df_valid.index.get_loc(idx)
+            print(f"第 {actual_idx + 1} 条原始CWE: {original_cwe}")
+            print(f"第 {actual_idx + 1} 条提取CWE: {extracted_cwe}")
+            print(f"第 {actual_idx + 1} 条DS结果: {new_row['ds_result']}")  # 新增
+            print(f"第 {actual_idx + 1} 条正确性: {is_correct}")
+            print(f"第 {actual_idx + 1} 条思维链长度: {len(reasoning_content)} 字符")
+            print(f"第 {actual_idx + 1} 条正式输出: {content[:100]}..." if len(content) > 100 else f"正式输出: {content}")
             print("-" * 50)
             
             # 添加延迟避免API限流
@@ -526,7 +724,8 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
             return new_row
             
         except Exception as e:
-            print(f"处理第 {idx + 1} 条记录时出错: {e}")
+            actual_idx = df_valid.index.get_loc(idx)
+            print(f"处理第 {actual_idx + 1} 条记录时出错: {e}")
             new_row['ds_think'] = f'处理错误: {e}'
             new_row['ds_output'] = ''
             new_row['ds_result'] = '处理错误'  # 新增
@@ -535,17 +734,19 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
             new_row['ds_think_reduced'] = ''  # 新增
             return new_row
     
-    new_df = pd.DataFrame(columns=df.columns)
     # 多线程处理
+    processed_rows = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
-        futures = [executor.submit(get_ds_result, idx, row) for idx, row in df.iterrows()]
-        # 收集结果
+        futures = {executor.submit(get_ds_result, idx, row): idx for idx, row in df_valid.iterrows()}
+        # 收集结果，保持原始索引
         for future in concurrent.futures.as_completed(futures):
+            original_idx = futures[future]
             new_row = future.result()
-            new_df = pd.concat([new_df, pd.DataFrame([new_row])], ignore_index=True)
+            processed_rows[original_idx] = new_row
     
-    # print(new_df)
+    # 按原始索引顺序构建结果DataFrame
+    new_df = pd.DataFrame([processed_rows[idx] for idx in sorted(processed_rows.keys())])
     
     # 最终保存完整文件
     save_file(new_df, output_file)
@@ -557,7 +758,10 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
     accuracy = correct_count / total_count * 100 if total_count > 0 else 0
     
     print(f"\n统计结果:")
-    print(f"总记录数: {len(new_df)}")
+    print(f"原始总记录数: {len(df)}")
+    print(f"有效记录数: {len(df_valid)}")
+    print(f"跳过记录数: {len(invalid_rows)}")
+    print(f"处理记录数: {len(new_df)}")
     print(f"成功处理: {total_count}")
     print(f"正确匹配: {correct_count}")
     print(f"准确率: {accuracy:.2f}%")
@@ -565,19 +769,20 @@ def process_file(input_file: str, output_file: str, api_key: str, batch_size: in
 if __name__ == "__main__":
     with open("config.json", "r") as f:
         config = json.load(f)
+    
     # 配置参数
     INPUT_FILE = config["INPUT_FILE"] # 输入文件路径（支持 .csv, .xlsx, .xls）
-    OUTPUT_FILE = "output_with_analysis.csv"  # 输出文件路径
+    # 输出文件名根据输出路径文件名命令，加上 result 后缀
+    OUTPUT_FILE = os.path.splitext(os.path.basename(INPUT_FILE))[0] + "_result.csv"
     API_KEY = config["DEEPSEEK_API_KEY"]  # 从配置文件获取API密钥
     MAX_WORKERS = config["MAX_WORKERS"] if "MAX_WORKERS" in config else 5  # 最大线程数，默认为5
     SHEET_NAME = None  # Excel工作表名称，None表示使用第一个工作表
-
-    # 由于并行速度够快，分片处理逻辑已删除，下面两行可忽略    
-    BATCH_SIZE = 5  # 每处理5条记录保存一次分片
-    SAVE_CHUNKS = True  # 是否保存分片文件
     
     start_time = time.time()
-    process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, batch_size=BATCH_SIZE, 
-                 sheet_name=SHEET_NAME, save_chunks=SAVE_CHUNKS, max_workers=MAX_WORKERS)
+
+    process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, sheet_name=SHEET_NAME,  max_workers=MAX_WORKERS)
+    # 后处理：检查并重新处理缺失的行
+    post_process_missing_rows(OUTPUT_FILE, API_KEY, max_workers=MAX_WORKERS)
+    
     end_time = time.time()
     print(f"处理完成！总耗时: {(end_time - start_time) / 60:.2f}分钟")
