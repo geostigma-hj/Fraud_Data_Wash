@@ -5,7 +5,6 @@ import time
 import ast
 import re
 import os
-import json
 from typing import Dict, Any, Tuple, Optional
 import concurrent.futures
 
@@ -124,12 +123,13 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
             print(f"二次API调用失败: {e}")
             return f"二次API调用失败: {e}", ""
     
-    def extract_cwe_with_model(self, ds_output: str) -> list:
+    def extract_cwe_with_model(self, ds_output: str, max_retries: int = 3) -> list:
         """
-        使用DeepSeek V3模型从输出结果中提取CWE编号
+        使用DeepSeek V3模型从输出结果中提取CWE编号（带重试机制）
         
         Args:
             ds_output: 原始分析输出结果
+            max_retries: 最大重试次数，默认为3次
             
         Returns:
             list: CWE编号列表
@@ -144,50 +144,100 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
 {{
 "result": 你的判断结果
 }}
-注意，判断结果只能为"无漏洞"或者["CWE-XXX"]格式的字符串数组，不要出现其他类型格式。"""
+注意，判断结果只能为"无漏洞"或者["CWE-XXX"]格式的字符串数组，不要出现其他类型格式。**请确保返回有效的JSON格式，不要返回空内容。**"""
 
         messages = [
             {"role": "user", "content": prompt}
         ]
         
-        try:
-            response = self.client_v3.chat.completions.create(
-                model="deepseek-v3",  # 使用百炼API调用DeepSeek V3
-                messages=messages,
-                response_format={
-                    'type': 'json_object'
-                },
-            )
-            
-            content = response.choices[0].message.content or ""
-            
-            # 解析JSON响应
+        for attempt in range(max_retries):
             try:
-                data = json.loads(content)
-                result = data.get('result', '')
+                print(f"CWE提取尝试第 {attempt + 1}/{max_retries} 次...")
                 
-                if result == '无漏洞':
-                    print(f"模型判断：无漏洞")
-                    return []
-                elif isinstance(result, list):
-                    # 验证列表中的元素都是CWE格式
-                    cwe_list = []
-                    for item in result:
-                        if isinstance(item, str) and item.startswith('CWE-'):
-                            cwe_list.append(item)
-                    print(f"模型提取CWE: {cwe_list}")
-                    return list(set(cwe_list))  # 去重
-                else:
-                    print(f"模型返回了不期望的格式: {result}")
-                    return []
+                response = self.client_v3.chat.completions.create(
+                    model="deepseek-v3",  # 使用百炼API调用DeepSeek V3
+                    messages=messages,
+                    response_format={
+                        'type': 'json_object'
+                    },
+                )
+                
+                content = response.choices[0].message.content or ""
+                
+                # 检查是否返回空内容
+                if not content.strip():
+                    print(f"第 {attempt + 1} 次尝试返回空内容，准备重试...")
+                    if attempt < max_retries - 1:
+                        time.sleep(1)  # 短暂等待后重试
+                        continue
+                    else:
+                        print("所有重试均返回空内容，使用正则表达式回退方案")
+                        return []
+                
+                # 解析JSON响应
+                try:
+                    data = json.loads(content)
+                    result = data.get('result', '')
                     
-            except json.JSONDecodeError as e:
-                print(f"JSON解析失败: {e}, 原始内容: {content}")
-                return []
-            
-        except Exception as e:
-            print(f"CWE提取API调用失败: {e}")
-            return []
+                    # 检查结果是否为空或无效
+                    if result == '' or result is None:
+                        print(f"第 {attempt + 1} 次尝试返回空结果，准备重试...")
+                        if attempt < max_retries - 1:
+                            time.sleep(1)
+                            continue
+                        else:
+                            print("所有重试均返回空结果")
+                            return []
+                    
+                    if result == '无漏洞':
+                        print(f"模型判断：无漏洞")
+                        return []
+                    elif isinstance(result, list):
+                        # 验证列表中的元素都是CWE格式
+                        cwe_list = []
+                        for item in result:
+                            if isinstance(item, str) and item.startswith('CWE-'):
+                                cwe_list.append(item)
+                        
+                        # 如果提取的CWE列表为空，尝试重试
+                        if not cwe_list and attempt < max_retries - 1:
+                            print(f"第 {attempt + 1} 次尝试未提取到有效CWE，准备重试...")
+                            time.sleep(1)
+                            continue
+                        
+                        print(f"模型提取CWE: {cwe_list}")
+                        return list(set(cwe_list))  # 去重
+                    else:
+                        print(f"第 {attempt + 1} 次尝试返回不期望的格式: {result}")
+                        if attempt < max_retries - 1:
+                            time.sleep(1)
+                            continue
+                        else:
+                            print("所有重试均返回不期望的格式")
+                            return []
+                        
+                except json.JSONDecodeError as e:
+                    print(f"第 {attempt + 1} 次尝试JSON解析失败: {e}, 原始内容: {content}")
+                    if attempt < max_retries - 1:
+                        time.sleep(1)
+                        continue
+                    else:
+                        print("所有重试均出现JSON解析错误")
+                        return []
+                
+            except Exception as e:
+                print(f"第 {attempt + 1} 次尝试API调用失败: {e}")
+                if attempt < max_retries - 1:
+                    print(f"等待2秒后进行重试...")
+                    time.sleep(2)
+                    continue
+                else:
+                    print("所有重试均失败")
+                    return []
+        
+        # 如果所有重试都失败了，返回空列表
+        print(f"经过 {max_retries} 次重试后仍然失败，返回空列表")
+        return []
     
     def extract_cwe_from_output(self, output: str) -> list:
         """
@@ -367,9 +417,9 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
         
         return reduced_content
 
-    def generate_correct_output_with_retry(self, func_body: str, original_cwe: str, cve_info: str, changed_statements: str) -> str:
+    def generate_correct_output_with_retry(self, func_body: str, original_cwe: str, cve_info: str, changed_statements: str) -> tuple:
         """
-        生成correct_output并进行验证，如果需要则重试一次
+        生成correct_output并进行验证，如果需要则重试2次
         
         Args:
             func_body: 函数体代码
@@ -378,11 +428,11 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
             changed_statements: 可能存在漏洞代码的区间
             
         Returns:
-            str: 最终的correct_output内容
+            tuple: (correct_output内容, 是否需要人工校正)
         """
         cwe_info = format_cwe_info(original_cwe)
         if not cwe_info:
-            return ''
+            return '', False
         
         # 检查是否为"NVD-CWE-noinfo"，如果是则不需要验证
         is_no_info = "NVD-CWE-noinfo" in original_cwe or "noinfo" in original_cwe.lower()
@@ -393,7 +443,7 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
         # 如果是noinfo或者验证通过，直接返回
         if is_no_info:
             print("CWE为noinfo类型，无需验证，直接使用生成结果")
-            return correct_content
+            return correct_content, False
         
         # 验证生成的内容是否包含正确的CWE
         extracted_cwe = self.extract_cwe_from_output(correct_content)
@@ -401,7 +451,7 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
         
         if is_correct == '√':
             print("生成的correct_output验证通过")
-            return correct_content
+            return correct_content, False
         else:
             # 如果验证失败，则重试2次
             for retry_cnt in range(2):
@@ -413,10 +463,13 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
                 
                 if is_correct == '√':
                     print("重试完成")
-                    return retry_content
+                    return retry_content, False
                 else:
                     print(f"第{retry_cnt+1}次重试失败")
-            return retry_content
+            
+            # 所有重试都失败了，需要人工校正
+            print("生成correct_output失败，需要人工校正")
+            return retry_content, True
 
 def get_file_extension(file_path: str) -> str:
     return os.path.splitext(file_path)[1].lower()
@@ -540,8 +593,8 @@ def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: s
     # 读取输出文件
     df = read_file(output_file)
     
-    # 检查需要的六个列
-    required_columns = ['ds_think', 'ds_output', 'ds_result', 'is_correct', 'correct_output', 'ds_think_reduced']
+    # 检查需要的七个列（新增manual_review_needed）
+    required_columns = ['ds_think', 'ds_output', 'ds_result', 'is_correct', 'correct_output', 'ds_think_reduced', 'manual_review_needed']
     
     # 找出有缺失值的行
     missing_rows = []
@@ -577,6 +630,7 @@ def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: s
                 row['is_correct'] = '×'
                 row['correct_output'] = ''
                 row['ds_think_reduced'] = ''
+                row['manual_review_needed'] = '是'  # 函数体为空需要人工校正
                 return idx, row
             
             # 调用API分析
@@ -597,6 +651,7 @@ def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: s
             # 根据正确性处理correct_output
             if is_correct == '√':
                 row['correct_output'] = content
+                row['manual_review_needed'] = '否'
                 print(f"第 {idx} 行处理完成 - 判断正确")
             else:
                 cwe_info = format_cwe_info(original_cwe)
@@ -604,12 +659,17 @@ def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: s
                     print(f"第 {idx} 行判断错误，使用正确CWE重新分析: {cwe_info}")
                     changed_statements = row.get('changed_statements', '')
                     cve_list = row.get('cve_list', '')
-                    correct_content = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
+                    correct_content, manual_review_needed = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
                     row['correct_output'] = correct_content
-                    print(f"第 {idx} 行二次分析完成")
+                    row['manual_review_needed'] = '是' if manual_review_needed else '否'
+                    if manual_review_needed:
+                        print(f"第 {idx} 行二次分析完成，但需要人工校正")
+                    else:
+                        print(f"第 {idx} 行二次分析完成")
                 else:
                     row['correct_output'] = ''
-                    print(f"第 {idx} 行无有效CWE信息")
+                    row['manual_review_needed'] = '是'  # 无有效CWE信息需要人工校正
+                    print(f"第 {idx} 行无有效CWE信息，需要人工校正")
             
             # 对ds_think进行删减处理
             if reasoning_content:
@@ -632,6 +692,7 @@ def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: s
             row['is_correct'] = '×'
             row['correct_output'] = ''
             row['ds_think_reduced'] = ''
+            row['manual_review_needed'] = '是'  # 处理错误需要人工校正
             return idx, row
     
     # 多线程处理缺失行
@@ -743,6 +804,8 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
         df_valid['correct_output'] = ''
     if 'ds_think_reduced' not in df_valid.columns:  # 新增删减后的思维链列
         df_valid['ds_think_reduced'] = ''
+    if 'manual_review_needed' not in df_valid.columns:  # 新增人工校正标识列
+        df_valid['manual_review_needed'] = ''
 
     def get_ds_result(idx, row):
         # 先基于 row 复制一个新行出来
@@ -774,6 +837,7 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
             if is_correct == '√':
                 # 如果正确，直接复制ds_output到correct_output
                 new_row['correct_output'] = content
+                new_row['manual_review_needed'] = '否'
                 print(f"第 {actual_idx + 1} 条处理完成 - 判断正确，直接复制输出")
             else:
                 # 如果不正确，使用正确CWE重新调用API
@@ -782,12 +846,17 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
                     print(f"第 {actual_idx + 1} 条判断错误，使用正确CWE重新分析: {cwe_info}")
                     changed_statements = row.get('changed_statements', '')  # 获取changed_statements字段，默认为空
                     cve_list = row.get('cve_list', '')  # 获取cve_list字段，默认为空
-                    correct_content = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
+                    correct_content, manual_review_needed = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
                     new_row['correct_output'] = correct_content
-                    print(f"第 {actual_idx + 1} 条二次分析完成")
+                    new_row['manual_review_needed'] = '是' if manual_review_needed else '否'
+                    if manual_review_needed:
+                        print(f"第 {actual_idx + 1} 条二次分析完成，但需要人工校正")
+                    else:
+                        print(f"第 {actual_idx + 1} 条二次分析完成")
                 else:
                     new_row['correct_output'] = ''
-                    print(f"第 {actual_idx + 1} 条无有效CWE信息")
+                    new_row['manual_review_needed'] = '是'  # 无有效CWE信息需要人工校正
+                    print(f"第 {actual_idx + 1} 条无有效CWE信息，需要人工校正")
             
             # 对ds_think进行删减处理
             if reasoning_content:
@@ -803,6 +872,7 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
             print(f"第 {actual_idx + 1} 条提取CWE: {extracted_cwe}")
             print(f"第 {actual_idx + 1} 条DS结果: {new_row['ds_result']}")  # 新增
             print(f"第 {actual_idx + 1} 条正确性: {is_correct}")
+            print(f"第 {actual_idx + 1} 条人工校正: {new_row['manual_review_needed']}")  # 新增
             print(f"第 {actual_idx + 1} 条思维链长度: {len(reasoning_content)} 字符")
             print(f"第 {actual_idx + 1} 条正式输出: {content[:100]}..." if len(content) > 100 else f"正式输出: {content}")
             print("-" * 50)
@@ -820,6 +890,7 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
             new_row['is_correct'] = '×'
             new_row['correct_output'] = ''
             new_row['ds_think_reduced'] = ''  # 新增
+            new_row['manual_review_needed'] = '是'  # 处理错误需要人工校正
             return new_row
     
     # 多线程处理
@@ -845,6 +916,10 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
     total_count = len(new_df[new_df['is_correct'].isin(['√', '×'])])
     accuracy = correct_count / total_count * 100 if total_count > 0 else 0
     
+    # 人工校正统计
+    manual_review_count = (new_df['manual_review_needed'] == '是').sum()
+    manual_review_rate = manual_review_count / len(new_df) * 100 if len(new_df) > 0 else 0
+    
     print(f"\n统计结果:")
     print(f"原始总记录数: {len(df)}")
     print(f"有效记录数: {len(df_valid)}")
@@ -853,10 +928,150 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
     print(f"成功处理: {total_count}")
     print(f"正确匹配: {correct_count}")
     print(f"准确率: {accuracy:.2f}%")
+    print(f"需要人工校正: {manual_review_count}/{len(new_df)} ({manual_review_rate:.2f}%)")
+    
+    # 如果有需要人工校正的记录，生成单独的文件
+    if manual_review_count > 0:
+        manual_review_df = new_df[new_df['manual_review_needed'] == '是'].copy()
+        manual_review_file = os.path.splitext(output_file)[0] + "_manual_review.csv"
+        save_file(manual_review_df, manual_review_file)
+        print(f"需要人工校正的 {manual_review_count} 条记录已保存到: {manual_review_file}")
+
+def validate_correct_result_column(input_file: str, bailian_api_key: str, max_workers: int = 5):
+    """
+    验证文件中correct_result列的CWE提取准确性（补丁函数）
+    
+    Args:
+        input_file: 输入文件路径（包含correct_result列的文件）
+        bailian_api_key: 百炼API密钥
+        max_workers: 最大线程数
+    """
+    print(f"开始验证 correct_result 列: {input_file}")
+    
+    # 生成输出文件名
+    base_name = os.path.splitext(input_file)[0]
+    output_file = f"{base_name}_validated.csv"
+    failed_file = f"{base_name}_manual_fix_needed.csv"
+    
+    # 读取文件
+    df = read_file(input_file)
+    
+    # 检查必需的列
+    required_columns = ['correct_result', 'cwe_list']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"缺少必需的列: {missing_columns}")
+    
+    print(f"文件读取成功，共 {len(df)} 行数据")
+    
+    # 初始化分析器用于CWE提取
+    analyzer = DeepSeekAnalyzer("", bailian_api_key, use_model_extraction=True)
+    
+    def process_row(idx):
+        """处理单行数据"""
+        row = df.loc[idx].copy()
+        try:
+            print(f"验证第 {idx + 1}/{len(df)} 条...")
+            
+            correct_result = row['correct_result']
+            original_cwe = row['cwe_list']
+            
+            if pd.isna(correct_result) or correct_result == '':
+                extracted_cwe = []
+                validation_result = '×'
+                failure_reason = 'correct_result为空'
+            else:
+                # 使用模型提取CWE
+                extracted_cwe = analyzer.extract_cwe_from_output(correct_result)
+                
+                # 检查是否能覆盖真实标签
+                validation_result = analyzer.check_cwe_correctness(original_cwe, extracted_cwe)
+                
+                if validation_result == '√':
+                    failure_reason = ''
+                else:
+                    failure_reason = f"CWE提取不匹配：期望{original_cwe}，实际提取{extracted_cwe}"
+            
+            time.sleep(0.5)  # 添加延迟避免API限流
+            return idx, extracted_cwe, validation_result, failure_reason
+            
+        except Exception as e:
+            print(f"验证第 {idx + 1} 条时出错: {e}")
+            return idx, [], '×', f'处理错误: {e}'
+    
+    # 多线程处理
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_row, idx) for idx in df.index]
+        
+        for future in concurrent.futures.as_completed(futures):
+            idx, extracted_cwe, validation_result, failure_reason = future.result()
+            results[idx] = (extracted_cwe, validation_result, failure_reason)
+    
+    # 更新DataFrame
+    extracted_cwe_list = []
+    validation_result_list = []
+    failure_reason_list = []
+    
+    for idx in df.index:
+        if idx in results:
+            extracted_cwe, validation_result, failure_reason = results[idx]
+            extracted_cwe_list.append(format_cwe_result(extracted_cwe))
+            validation_result_list.append(validation_result)
+            failure_reason_list.append(failure_reason)
+        else:
+            extracted_cwe_list.append('处理失败')
+            validation_result_list.append('×')
+            failure_reason_list.append('处理失败')
+    
+    # 添加验证结果列
+    df['validation_result'] = validation_result_list
+    df['failure_reason'] = failure_reason_list
+    
+    # 统计结果
+    total_rows = len(df)
+    success_count = (df['validation_result'] == '√').sum()
+    fail_count = (df['validation_result'] == '×').sum()
+    
+    print(f"\n验证结果统计:")
+    print(f"总条数: {total_rows}")
+    print(f"验证成功: {success_count} ({success_count/total_rows*100:.2f}%)")
+    print(f"验证失败: {fail_count} ({fail_count/total_rows*100:.2f}%)")
+    
+    # 保存所有验证结果
+    save_file(df, output_file)
+    print(f"完整验证结果已保存到: {output_file}")
+    
+    # 筛选并保存失败的记录
+    if fail_count > 0:
+        failed_df = df[df['validation_result'] == '×'].copy()
+        save_file(failed_df, failed_file)
+        print(f"需要人工修正的 {fail_count} 条记录已保存到: {failed_file}")
+    else:
+        print("所有记录验证通过，无需人工修正！")
+    
+    return output_file, failed_file
 
 if __name__ == "__main__":
-    with open("config.json", "r") as f:
-        config = json.load(f)
+    try:
+        with open("config.json", "r") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print("错误: 找不到 config.json 文件，请确保配置文件存在")
+        exit(1)
+    except json.JSONDecodeError as e:
+        print(f"错误: config.json 文件格式不正确: {e}")
+        exit(1)
+    except Exception as e:
+        print(f"错误: 读取配置文件时出错: {e}")
+        exit(1)
+    
+    # 检查必需的配置项
+    required_configs = ["INPUT_FILE", "DEEPSEEK_API_KEY", "BAILIAN_API_KEY"]
+    missing_configs = [key for key in required_configs if key not in config]
+    if missing_configs:
+        print(f"错误: 配置文件中缺少必需的配置项: {missing_configs}")
+        exit(1)
     
     # 配置参数
     INPUT_FILE = config["INPUT_FILE"] # 输入文件路径（支持 .csv, .xlsx, .xls）
@@ -864,15 +1079,13 @@ if __name__ == "__main__":
     OUTPUT_FILE = os.path.splitext(os.path.basename(INPUT_FILE))[0] + "_result.csv"
     API_KEY = config["DEEPSEEK_API_KEY"]  # 从配置文件获取API密钥
     BAILIAN_API_KEY = config["BAILIAN_API_KEY"]
-    MAX_WORKERS = config["MAX_WORKERS"] if "MAX_WORKERS" in config else 5  # 最大线程数，默认为5
-    USE_MODEL_EXTRACTION = config.get("USE_MODEL_EXTRACTION", True)  # 是否使用模型提取CWE，默认为True
+    MAX_WORKERS = config.get("MAX_WORKERS", 5)  # 最大线程数，默认为5
     SHEET_NAME = None  # Excel工作表名称，None表示使用第一个工作表
     USE_MODEL_EXTRACTION = True
+    
     start_time = time.time()
-
     process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, BAILIAN_API_KEY, sheet_name=SHEET_NAME, max_workers=MAX_WORKERS, use_model_extraction=USE_MODEL_EXTRACTION)
     # 后处理：检查并重新处理缺失的行
     post_process_missing_rows(OUTPUT_FILE, API_KEY, BAILIAN_API_KEY, max_workers=MAX_WORKERS, use_model_extraction=USE_MODEL_EXTRACTION)
-    
     end_time = time.time()
     print(f"处理完成！总耗时: {(end_time - start_time) / 60:.2f}分钟")
