@@ -10,17 +10,24 @@ from typing import Dict, Any, Tuple, Optional
 import concurrent.futures
 
 class DeepSeekAnalyzer:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, bailian_api_key: str = None, use_model_extraction: bool = True):
         """
         初始化DeepSeek分析器
         
         Args:
             api_key: DeepSeek API密钥
+            bailian_api_key: 百炼API密钥，用于调用DeepSeek V3
+            use_model_extraction: 是否使用模型进行CWE提取，默认为True
         """
         self.client = OpenAI(
             api_key=api_key,
             base_url="https://api.deepseek.com"
         )
+        self.client_v3 = OpenAI(
+            api_key=bailian_api_key,
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+        self.use_model_extraction = use_model_extraction
     
     def analyze_function(self, func_body: str) -> Tuple[str, str]:
         """
@@ -117,9 +124,74 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
             print(f"二次API调用失败: {e}")
             return f"二次API调用失败: {e}", ""
     
+    def extract_cwe_with_model(self, ds_output: str) -> list:
+        """
+        使用DeepSeek V3模型从输出结果中提取CWE编号
+        
+        Args:
+            ds_output: 原始分析输出结果
+            
+        Returns:
+            list: CWE编号列表
+        """
+        if not ds_output:
+            return []
+        
+        prompt = f"""{ds_output}
+这是一段代码漏洞检测的判断结果，请你帮我判断一下这段文本是否认为原始代码中存在漏洞，如果存在，请返回所有不同的 CWE 编号，如果不存在，则输出"无漏洞"。
+
+你需要返回json格式的输出，具体格式要求如下：
+{{
+"result": 你的判断结果
+}}
+注意，判断结果只能为"无漏洞"或者["CWE-XXX"]格式的字符串数组，不要出现其他类型格式。"""
+
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+        
+        try:
+            response = self.client_v3.chat.completions.create(
+                model="deepseek-v3",  # 使用百炼API调用DeepSeek V3
+                messages=messages,
+                response_format={
+                    'type': 'json_object'
+                },
+            )
+            
+            content = response.choices[0].message.content or ""
+            
+            # 解析JSON响应
+            try:
+                data = json.loads(content)
+                result = data.get('result', '')
+                
+                if result == '无漏洞':
+                    print(f"模型判断：无漏洞")
+                    return []
+                elif isinstance(result, list):
+                    # 验证列表中的元素都是CWE格式
+                    cwe_list = []
+                    for item in result:
+                        if isinstance(item, str) and item.startswith('CWE-'):
+                            cwe_list.append(item)
+                    print(f"模型提取CWE: {cwe_list}")
+                    return list(set(cwe_list))  # 去重
+                else:
+                    print(f"模型返回了不期望的格式: {result}")
+                    return []
+                    
+            except json.JSONDecodeError as e:
+                print(f"JSON解析失败: {e}, 原始内容: {content}")
+                return []
+            
+        except Exception as e:
+            print(f"CWE提取API调用失败: {e}")
+            return []
+    
     def extract_cwe_from_output(self, output: str) -> list:
         """
-        从输出结果中提取CWE编号
+        从输出结果中提取CWE编号（优先使用模型提取，失败则回退到正则表达式）
         
         Args:
             output: 分析输出结果
@@ -129,6 +201,18 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
         """
         if not output:
             return []
+        
+        # 根据配置决定是否使用模型提取CWE
+        if self.use_model_extraction:
+            try:
+                model_result = self.extract_cwe_with_model(output)
+                print(f"使用模型提取CWE成功: {model_result}")
+                return model_result
+            except Exception as e:
+                print(f"模型提取CWE失败，回退到正则表达式方法: {e}")
+        
+        # 使用正则表达式方法
+        print("使用正则表达式方法提取CWE")
         
         # 首先检查是否明确表示无漏洞
         no_vuln_patterns = [
@@ -143,7 +227,7 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
         
         for pattern in no_vuln_patterns:
             if re.search(pattern, output, re.IGNORECASE):
-                print(f"检测到无漏洞结论，忽略文本中的CWE编号")
+                print(f"正则检测到无漏洞结论，忽略文本中的CWE编号")
                 return []
         
         try:
@@ -176,6 +260,7 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
                         print(f"虽然提到了CWE编号{extracted_cwes}，但结论是无漏洞")
                         return []
             
+            print(f"正则表达式提取CWE: {extracted_cwes}")
             return extracted_cwes
         
         return []
@@ -439,14 +524,16 @@ def format_cwe_result(cwe_list: list) -> str:
     else:
         return ", ".join(cwe_list)
 
-def post_process_missing_rows(output_file: str, api_key: str, max_workers: int = 5):
+def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: str = None, max_workers: int = 5, use_model_extraction: bool = True):
     """
     后处理：检查输出文件中的缺失行并重新处理
     
     Args:
         output_file: 输出文件路径
         api_key: DeepSeek API密钥
+        bailian_api_key: 百炼API密钥，用于调用DeepSeek V3
         max_workers: 最大线程数
+        use_model_extraction: 是否使用模型进行CWE提取
     """
     print(f"\n开始后处理检查: {output_file}")
     
@@ -474,7 +561,7 @@ def post_process_missing_rows(output_file: str, api_key: str, max_workers: int =
     print(f"发现 {len(missing_rows)} 行需要重新处理: {missing_rows}")
     
     # 初始化分析器
-    analyzer = DeepSeekAnalyzer(api_key)
+    analyzer = DeepSeekAnalyzer(api_key, bailian_api_key, use_model_extraction)
     
     def process_missing_row(idx):
         """处理单个缺失行"""
@@ -561,8 +648,8 @@ def post_process_missing_rows(output_file: str, api_key: str, max_workers: int =
     save_file(df, output_file)
     print(f"后处理完成！已更新 {len(missing_rows)} 行，结果保存到 {output_file}")
 
-def process_file(input_file: str, output_file: str, api_key: str,
-                sheet_name: str = None, max_workers: int=5, **file_kwargs):
+def process_file(input_file: str, output_file: str, api_key: str, bailian_api_key: str = None,
+                sheet_name: str = None, max_workers: int=5, use_model_extraction: bool = True, **file_kwargs):
     """
     处理文件（支持CSV和XLSX）
     
@@ -570,9 +657,10 @@ def process_file(input_file: str, output_file: str, api_key: str,
         input_file: 输入文件路径
         output_file: 输出文件路径
         api_key: DeepSeek API密钥
-        batch_size: 批处理大小，每处理这么多条记录就保存一次分片（已弃用）
+        bailian_api_key: 百炼API密钥，用于调用DeepSeek V3
         sheet_name: Excel工作表名称（仅对xlsx文件有效）
-        save_chunks: 是否保存分片文件
+        max_workers: 最大线程数
+        use_model_extraction: 是否使用模型进行CWE提取
         **file_kwargs: 传递给文件读取函数的额外参数
     """
     # 读取文件
@@ -640,7 +728,7 @@ def process_file(input_file: str, output_file: str, api_key: str,
     print(f"开始处理 {len(df_valid)} 条有效记录...")
     
     # 初始化分析器
-    analyzer = DeepSeekAnalyzer(api_key)
+    analyzer = DeepSeekAnalyzer(api_key, bailian_api_key, use_model_extraction)
     
     # 添加新列（如果不存在）
     if 'ds_think' not in df_valid.columns:
@@ -775,14 +863,16 @@ if __name__ == "__main__":
     # 输出文件名根据输出路径文件名命令，加上 result 后缀
     OUTPUT_FILE = os.path.splitext(os.path.basename(INPUT_FILE))[0] + "_result.csv"
     API_KEY = config["DEEPSEEK_API_KEY"]  # 从配置文件获取API密钥
+    BAILIAN_API_KEY = config["BAILIAN_API_KEY"]
     MAX_WORKERS = config["MAX_WORKERS"] if "MAX_WORKERS" in config else 5  # 最大线程数，默认为5
+    USE_MODEL_EXTRACTION = config.get("USE_MODEL_EXTRACTION", True)  # 是否使用模型提取CWE，默认为True
     SHEET_NAME = None  # Excel工作表名称，None表示使用第一个工作表
-    
+    USE_MODEL_EXTRACTION = True
     start_time = time.time()
 
-    process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, sheet_name=SHEET_NAME,  max_workers=MAX_WORKERS)
+    process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, BAILIAN_API_KEY, sheet_name=SHEET_NAME, max_workers=MAX_WORKERS, use_model_extraction=USE_MODEL_EXTRACTION)
     # 后处理：检查并重新处理缺失的行
-    post_process_missing_rows(OUTPUT_FILE, API_KEY, max_workers=MAX_WORKERS)
+    post_process_missing_rows(OUTPUT_FILE, API_KEY, BAILIAN_API_KEY, max_workers=MAX_WORKERS, use_model_extraction=USE_MODEL_EXTRACTION)
     
     end_time = time.time()
     print(f"处理完成！总耗时: {(end_time - start_time) / 60:.2f}分钟")
