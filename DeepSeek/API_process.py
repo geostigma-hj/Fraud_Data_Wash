@@ -22,10 +22,30 @@ class DeepSeekAnalyzer:
             api_key=api_key,
             base_url="https://api.deepseek.com"
         )
-        self.client_v3 = OpenAI(
-            api_key=bailian_api_key,
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
-        )
+        
+        # 处理百炼API异常情况
+        if bailian_api_key and bailian_api_key != "your_bailian_api_key":
+            try:
+                self.client_v3 = OpenAI(
+                    api_key=bailian_api_key,
+                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+                )
+                self.use_bailian_api = True
+            except Exception as e:
+                print(f"百炼API初始化失败，使用DeepSeek API替代: {e}")
+                self.client_v3 = OpenAI(
+                    api_key=api_key,
+                    base_url="https://api.deepseek.com"
+                )
+                self.use_bailian_api = False
+        else:
+            print("百炼API配置异常，使用DeepSeek API替代")
+            self.client_v3 = OpenAI(
+                api_key=api_key,
+                base_url="https://api.deepseek.com"
+            )
+            self.use_bailian_api = False
+        
         self.use_model_extraction = use_model_extraction
     
     def analyze_function(self, func_body: str) -> Tuple[str, str]:
@@ -69,6 +89,82 @@ class DeepSeekAnalyzer:
         except Exception as e:
             print(f"API调用失败: {e}")
             return f"API调用失败: {e}", ""
+    
+    def analyze_vulnerability_focused(self, func_body: str, original_cwe: str, changed_statements: str) -> Tuple[str, str, str]:
+        """
+        新增三列分析结果：prompt7, ds_thinking7, ds_response7
+        
+        Args:
+            func_body: 函数体代码
+            cwe_info: CWE漏洞信息
+            changed_statements: 可能存在漏洞的代码语句
+            
+        Returns:
+            tuple: (prompt内容, 思维链reasoning_content, 正式输出结果content)
+        """
+        cwe_info = format_cwe_info(original_cwe)
+        prompt = f"""你是一名代码漏洞分析专家，现在你需要帮我分析一段存在漏洞的代码，代码具体内容如下：
+{func_body}
+
+漏洞类型为：
+{cwe_info}
+
+对应的漏洞行和代码语句为：
+{changed_statements}
+
+**【注意事项】**：
+1. 这里给出的漏洞行不一定准确，因此你只需要关注具体漏洞语句的内容。
+2. 原始代码中明确存在{cwe_info}漏洞，因此请仔细分析上述代码和我提供的漏洞代码区间信息，不要输出无漏洞或者其他类型的CWE漏洞分析结果。
+3. 请给出不超过500字的精简漏洞分析过程，不要输出修复建议之类的无关内容。"""
+
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+        
+        last_error = None
+        
+        # 增加重试机制，最多重试3次
+        for attempt in range(3):
+            try:
+                print(f"专门漏洞分析调用尝试第 {attempt + 1}/3 次...")
+                
+                response = self.client.chat.completions.create(
+                    model="deepseek-reasoner",
+                    messages=messages,
+                )
+                
+                # 获取思维链和正式输出
+                reasoning_content = response.choices[0].message.reasoning_content or ""
+                content = response.choices[0].message.content or ""
+
+                # 验证生成的内容是否包含正确的CWE
+                extracted_cwe = self.extract_cwe_from_output(content)
+                is_correct = self.check_cwe_correctness(original_cwe, extracted_cwe)
+                
+                if is_correct == '√':
+                    print("生成的分析结果验证通过")
+                    return prompt, reasoning_content, content
+                else:
+                    print(f"第 {attempt + 1} 次尝试验证失败，期望CWE: {cwe_info}，实际提取: {extracted_cwe}")
+                    if attempt < 2:  # 不是最后一次重试
+                        continue
+                    else:
+                        # 最后一次重试也失败了，返回结果（不进行验证）
+                        print("所有重试均验证失败，返回最后一次分析结果")
+                        return prompt, reasoning_content, content
+                
+            except Exception as e:
+                print(f"第 {attempt + 1} 次专门漏洞分析API调用失败: {e}")
+                last_error = e
+                if attempt < 2:  # 不是最后一次重试
+                    time.sleep(1)
+                    continue
+                else:
+                    # 最后一次重试也失败了
+                    return prompt, f"API调用失败: {e}", ""
+        
+        # 如果所有重试都失败了（理论上不会执行到这里）
+        return prompt, f"API调用失败: {last_error}", ""
     
     def analyze_with_correct_cwe(self, func_body: str, cwe_info: str, cve_info: str = "", changed_statements: str = "") -> Tuple[str, str]:
         """
@@ -154,8 +250,14 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
             try:
                 print(f"CWE提取尝试第 {attempt + 1}/{max_retries} 次...")
                 
+                # 根据是否使用百炼API决定模型选择
+                if self.use_bailian_api:
+                    model_name = "deepseek-v3"
+                else:
+                    model_name = "deepseek-chat"  # 使用DeepSeek API时的模型名
+                
                 response = self.client_v3.chat.completions.create(
-                    model="deepseek-v3",  # 使用百炼API调用DeepSeek V3
+                    model=model_name,
                     messages=messages,
                     response_format={
                         'type': 'json_object'
@@ -176,7 +278,15 @@ kfree_skb(nxpdev->rx_skb);          // SKB缓冲区释放
                 
                 # 解析JSON响应
                 try:
-                    data = json.loads(content)
+                    # 清理可能的markdown代码块标记
+                    cleaned_content = content.strip()
+                    if cleaned_content.startswith('```json'):
+                        cleaned_content = cleaned_content[7:]  # 去掉开头的```json
+                    if cleaned_content.endswith('```'):
+                        cleaned_content = cleaned_content[:-3]  # 去掉结尾的```
+                    cleaned_content = cleaned_content.strip()
+                    
+                    data = json.loads(cleaned_content)
                     result = data.get('result', '')
                     
                     # 检查结果是否为空或无效
@@ -577,7 +687,7 @@ def format_cwe_result(cwe_list: list) -> str:
     else:
         return ", ".join(cwe_list)
 
-def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: str = None, max_workers: int = 5, use_model_extraction: bool = True):
+def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: str = None, max_workers: int = 5, use_model_extraction: bool = True, only_new_fields: bool = False):
     """
     后处理：检查输出文件中的缺失行并重新处理
     
@@ -587,14 +697,33 @@ def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: s
         bailian_api_key: 百炼API密钥，用于调用DeepSeek V3
         max_workers: 最大线程数
         use_model_extraction: 是否使用模型进行CWE提取
+        only_new_fields: 是否只处理新增的三个字段（prompt7, ds_thinking7, ds_response7）
     """
     print(f"\n开始后处理检查: {output_file}")
     
     # 读取输出文件
     df = read_file(output_file)
     
-    # 检查需要的七个列（新增manual_review_needed）
-    required_columns = ['ds_think', 'ds_output', 'ds_result', 'is_correct', 'correct_output', 'ds_think_reduced', 'manual_review_needed']
+    # 在增量更新模式下，记录原始列名并过滤无关列
+    if only_new_fields:
+        # 过滤掉pandas自动生成的Unnamed列
+        original_columns = [col for col in df.columns if not col.startswith('Unnamed')]
+        df = df[original_columns]  # 只保留有意义的列
+        print(f"增量模式：保留原始列 {len(original_columns)} 个")
+        
+        # 确保新增的三个字段列存在
+        for col in ['prompt7', 'ds_thinking7', 'ds_response7']:
+            if col not in df.columns:
+                df[col] = ''  # 只添加缺失的新字段列
+    
+    # 根据参数决定检查哪些列
+    if only_new_fields:
+        required_columns = ['prompt7', 'ds_thinking7', 'ds_response7']
+        print("只检查新增的三个字段: prompt7, ds_thinking7, ds_response7")
+    else:
+        # 检查需要的十个列（新增manual_review_needed, prompt7, ds_thinking7, ds_response7）
+        required_columns = ['ds_think', 'ds_output', 'ds_result', 'is_correct', 'correct_output', 'ds_think_reduced', 'manual_review_needed', 'prompt7', 'ds_thinking7', 'ds_response7']
+        print("检查所有字段")
     
     # 找出有缺失值的行
     missing_rows = []
@@ -624,61 +753,102 @@ def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: s
             
             func_body = row['func_body']
             if pd.isna(func_body) or func_body == '':
-                row['ds_think'] = '函数体为空'
-                row['ds_output'] = ''
-                row['ds_result'] = '无漏洞'
-                row['is_correct'] = '×'
-                row['correct_output'] = ''
-                row['ds_think_reduced'] = ''
-                row['manual_review_needed'] = '是'  # 函数体为空需要人工校正
+                if only_new_fields:
+                    # 只处理新增字段
+                    row['prompt7'] = ''
+                    row['ds_thinking7'] = '函数体为空'
+                    row['ds_response7'] = ''
+                else:
+                    # 处理所有字段
+                    row['ds_think'] = '函数体为空'
+                    row['ds_output'] = ''
+                    row['ds_result'] = '无漏洞'
+                    row['is_correct'] = '×'
+                    row['correct_output'] = ''
+                    row['ds_think_reduced'] = ''
+                    row['manual_review_needed'] = '是'  # 函数体为空需要人工校正
+                    # 新增字段的处理
+                    row['prompt7'] = ''
+                    row['ds_thinking7'] = '函数体为空'
+                    row['ds_response7'] = ''
                 return idx, row
             
-            # 调用API分析
-            reasoning_content, content = analyzer.analyze_function(func_body)
-            
-            # 存储结果
-            row['ds_think'] = reasoning_content
-            row['ds_output'] = content
-            
-            # 提取CWE并检查正确性
-            extracted_cwe = analyzer.extract_cwe_from_output(content)
-            row['ds_result'] = format_cwe_result(extracted_cwe)
-            
-            original_cwe = row['cwe_list']
-            is_correct = analyzer.check_cwe_correctness(original_cwe, extracted_cwe)
-            row['is_correct'] = is_correct
-            
-            # 根据正确性处理correct_output
-            if is_correct == '√':
-                row['correct_output'] = content
-                row['manual_review_needed'] = '否'
-                print(f"第 {idx} 行处理完成 - 判断正确")
-            else:
-                cwe_info = format_cwe_info(original_cwe)
-                if cwe_info:
-                    print(f"第 {idx} 行判断错误，使用正确CWE重新分析: {cwe_info}")
-                    changed_statements = row.get('changed_statements', '')
-                    cve_list = row.get('cve_list', '')
-                    correct_content, manual_review_needed = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
-                    row['correct_output'] = correct_content
-                    row['manual_review_needed'] = '是' if manual_review_needed else '否'
-                    if manual_review_needed:
-                        print(f"第 {idx} 行二次分析完成，但需要人工校正")
-                    else:
-                        print(f"第 {idx} 行二次分析完成")
+            # 根据参数决定是否进行原有的分析处理
+            if not only_new_fields:
+                # 调用API分析
+                reasoning_content, content = analyzer.analyze_function(func_body)
+                
+                # 存储结果
+                row['ds_think'] = reasoning_content
+                row['ds_output'] = content
+                
+                # 提取CWE并检查正确性
+                extracted_cwe = analyzer.extract_cwe_from_output(content)
+                row['ds_result'] = format_cwe_result(extracted_cwe)
+                
+                original_cwe = row['cwe_list']
+                is_correct = analyzer.check_cwe_correctness(original_cwe, extracted_cwe)
+                row['is_correct'] = is_correct
+                
+                # 根据正确性处理correct_output
+                if is_correct == '√':
+                    row['correct_output'] = content
+                    row['manual_review_needed'] = '否'
+                    print(f"第 {idx} 行处理完成 - 判断正确")
                 else:
-                    row['correct_output'] = ''
-                    row['manual_review_needed'] = '是'  # 无有效CWE信息需要人工校正
-                    print(f"第 {idx} 行无有效CWE信息，需要人工校正")
+                    cwe_info = format_cwe_info(original_cwe)
+                    if cwe_info:
+                        print(f"第 {idx} 行判断错误，使用正确CWE重新分析: {cwe_info}")
+                        changed_statements = row.get('changed_statements', '')
+                        cve_list = row.get('cve_list', '')
+                        correct_content, manual_review_needed = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
+                        row['correct_output'] = correct_content
+                        row['manual_review_needed'] = '是' if manual_review_needed else '否'
+                        if manual_review_needed:
+                            print(f"第 {idx} 行二次分析完成，但需要人工校正")
+                        else:
+                            print(f"第 {idx} 行二次分析完成")
+                    else:
+                        row['correct_output'] = ''
+                        row['manual_review_needed'] = '是'  # 无有效CWE信息需要人工校正
+                        print(f"第 {idx} 行无有效CWE信息，需要人工校正")
+                
+                # 对ds_think进行删减处理
+                if reasoning_content:
+                    print(f"第 {idx} 行正在删减思维链内容，原长度: {len(reasoning_content)} 字符")
+                    reduced_thinking = analyzer.reduce_thinking_content(reasoning_content)
+                    row['ds_think_reduced'] = reduced_thinking
+                    print(f"第 {idx} 行思维链删减完成，新长度: {len(reduced_thinking)} 字符")
+                else:
+                    row['ds_think_reduced'] = ''
             
-            # 对ds_think进行删减处理
-            if reasoning_content:
-                print(f"第 {idx} 行正在删减思维链内容，原长度: {len(reasoning_content)} 字符")
-                reduced_thinking = analyzer.reduce_thinking_content(reasoning_content)
-                row['ds_think_reduced'] = reduced_thinking
-                print(f"第 {idx} 行思维链删减完成，新长度: {len(reduced_thinking)} 字符")
-            else:
-                row['ds_think_reduced'] = ''
+            # 新增功能：生成prompt7, ds_thinking7, ds_response7三个字段
+            try:
+                # 获取必要的信息
+                original_cwe = row['cwe_list']
+                cwe_info = format_cwe_info(original_cwe)  # 需要格式化CWE信息用于判断
+                changed_statements = row.get('changed_statements', '')
+                
+                if cwe_info:
+                    print(f"第 {idx} 行正在生成专门漏洞分析...")
+                    prompt7, ds_thinking7, ds_response7 = analyzer.analyze_vulnerability_focused(func_body, original_cwe, changed_statements)
+                    
+                    row['prompt7'] = prompt7
+                    row['ds_thinking7'] = ds_thinking7
+                    row['ds_response7'] = ds_response7
+                    
+                    print(f"第 {idx} 行专门漏洞分析完成")
+                else:
+                    print(f"第 {idx} 行无有效CWE信息，跳过专门漏洞分析")
+                    row['prompt7'] = ''
+                    row['ds_thinking7'] = ''
+                    row['ds_response7'] = ''
+                    
+            except Exception as e:
+                print(f"第 {idx} 行专门漏洞分析失败: {e}")
+                row['prompt7'] = ''
+                row['ds_thinking7'] = f'分析失败: {e}'
+                row['ds_response7'] = ''
             
             print(f"第 {idx} 行重新处理完成")
             time.sleep(1)  # 添加延迟避免API限流
@@ -686,13 +856,24 @@ def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: s
             
         except Exception as e:
             print(f"重新处理第 {idx} 行时出错: {e}")
-            row['ds_think'] = f'处理错误: {e}'
-            row['ds_output'] = ''
-            row['ds_result'] = '处理错误'
-            row['is_correct'] = '×'
-            row['correct_output'] = ''
-            row['ds_think_reduced'] = ''
-            row['manual_review_needed'] = '是'  # 处理错误需要人工校正
+            if only_new_fields:
+                # 只处理新增字段的错误
+                row['prompt7'] = ''
+                row['ds_thinking7'] = f'处理错误: {e}'
+                row['ds_response7'] = ''
+            else:
+                # 处理所有字段的错误
+                row['ds_think'] = f'处理错误: {e}'
+                row['ds_output'] = ''
+                row['ds_result'] = '处理错误'
+                row['is_correct'] = '×'
+                row['correct_output'] = ''
+                row['ds_think_reduced'] = ''
+                row['manual_review_needed'] = '是'  # 处理错误需要人工校正
+                # 新增字段的错误处理
+                row['prompt7'] = ''
+                row['ds_thinking7'] = f'处理错误: {e}'
+                row['ds_response7'] = ''
             return idx, row
     
     # 多线程处理缺失行
@@ -702,15 +883,32 @@ def post_process_missing_rows(output_file: str, api_key: str, bailian_api_key: s
         for future in concurrent.futures.as_completed(futures):
             idx, updated_row = future.result()
             # 更新原DataFrame
-            for col in required_columns:
-                df.at[idx, col] = updated_row[col]
+            if only_new_fields:
+                # 增量更新模式：只更新新增的三个字段
+                for col in ['prompt7', 'ds_thinking7', 'ds_response7']:
+                    if col in updated_row:
+                        df.at[idx, col] = updated_row[col]
+            else:
+                # 完整处理模式：更新所有相关字段
+                for col in required_columns:
+                    df.at[idx, col] = updated_row[col]
     
     # 保存更新后的文件
-    save_file(df, output_file)
-    print(f"后处理完成！已更新 {len(missing_rows)} 行，结果保存到 {output_file}")
+    if only_new_fields:
+        # 增量更新模式：只保存原始列+新增的三个字段
+        save_columns = original_columns + ['prompt7', 'ds_thinking7', 'ds_response7']
+        # 去重并保持原有顺序
+        save_columns = list(dict.fromkeys(save_columns))  
+        df_to_save = df[save_columns]
+        save_file(df_to_save, output_file)
+        print(f"增量更新完成！已更新 {len(missing_rows)} 行的新增字段，保存 {len(save_columns)} 列到 {output_file}")
+    else:
+        # 完整处理模式：保存所有列
+        save_file(df, output_file)
+        print(f"后处理完成！已更新 {len(missing_rows)} 行，结果保存到 {output_file}")
 
 def process_file(input_file: str, output_file: str, api_key: str, bailian_api_key: str = None,
-                sheet_name: str = None, max_workers: int=5, use_model_extraction: bool = True, **file_kwargs):
+                sheet_name: str = None, max_workers: int=5, use_model_extraction: bool = True, only_new_fields: bool = False, **file_kwargs):
     """
     处理文件（支持CSV和XLSX）
     
@@ -722,6 +920,7 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
         sheet_name: Excel工作表名称（仅对xlsx文件有效）
         max_workers: 最大线程数
         use_model_extraction: 是否使用模型进行CWE提取
+        only_new_fields: 是否只处理新增的三个字段（prompt7, ds_thinking7, ds_response7）
         **file_kwargs: 传递给文件读取函数的额外参数
     """
     # 读取文件
@@ -791,21 +990,40 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
     # 初始化分析器
     analyzer = DeepSeekAnalyzer(api_key, bailian_api_key, use_model_extraction)
     
-    # 添加新列（如果不存在）
-    if 'ds_think' not in df_valid.columns:
-        df_valid['ds_think'] = ''
-    if 'ds_output' not in df_valid.columns:
-        df_valid['ds_output'] = ''
-    if 'ds_result' not in df_valid.columns:  # 新增列
-        df_valid['ds_result'] = ''
-    if 'is_correct' not in df_valid.columns:
-        df_valid['is_correct'] = ''
-    if 'correct_output' not in df_valid.columns:
-        df_valid['correct_output'] = ''
-    if 'ds_think_reduced' not in df_valid.columns:  # 新增删减后的思维链列
-        df_valid['ds_think_reduced'] = ''
-    if 'manual_review_needed' not in df_valid.columns:  # 新增人工校正标识列
-        df_valid['manual_review_needed'] = ''
+    # 根据模式添加新列
+    if only_new_fields:
+        print("增量更新模式：只添加新增的三个字段")
+        # 增量更新模式：只添加新增的三个字段
+        if 'prompt7' not in df_valid.columns:
+            df_valid['prompt7'] = ''
+        if 'ds_thinking7' not in df_valid.columns:
+            df_valid['ds_thinking7'] = ''
+        if 'ds_response7' not in df_valid.columns:
+            df_valid['ds_response7'] = ''
+    else:
+        print("完整处理模式：添加所有字段")
+        # 完整处理模式：添加所有列（如果不存在）
+        if 'ds_think' not in df_valid.columns:
+            df_valid['ds_think'] = ''
+        if 'ds_output' not in df_valid.columns:
+            df_valid['ds_output'] = ''
+        if 'ds_result' not in df_valid.columns:  # 新增列
+            df_valid['ds_result'] = ''
+        if 'is_correct' not in df_valid.columns:
+            df_valid['is_correct'] = ''
+        if 'correct_output' not in df_valid.columns:
+            df_valid['correct_output'] = ''
+        if 'ds_think_reduced' not in df_valid.columns:  # 新增删减后的思维链列
+            df_valid['ds_think_reduced'] = ''
+        if 'manual_review_needed' not in df_valid.columns:  # 新增人工校正标识列
+            df_valid['manual_review_needed'] = ''
+        # 新增的三个字段
+        if 'prompt7' not in df_valid.columns:
+            df_valid['prompt7'] = ''
+        if 'ds_thinking7' not in df_valid.columns:
+            df_valid['ds_thinking7'] = ''
+        if 'ds_response7' not in df_valid.columns:
+            df_valid['ds_response7'] = ''
 
     def get_ds_result(idx, row):
         # 先基于 row 复制一个新行出来
@@ -818,64 +1036,114 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
             # 预检查已确保func_body不为空，此检查已不需要
             func_body = new_row['func_body']
             
-            # 调用API分析
-            reasoning_content, content = analyzer.analyze_function(func_body)
-            
-            # 存储结果
-            new_row['ds_think'] = reasoning_content
-            new_row['ds_output'] = content
-            
-            # 提取CWE并检查正确性
-            extracted_cwe = analyzer.extract_cwe_from_output(content)
-            new_row['ds_result'] = format_cwe_result(extracted_cwe)  # 新增
-            
-            original_cwe = row['cwe_list']
-            is_correct = analyzer.check_cwe_correctness(original_cwe, extracted_cwe)
-            new_row['is_correct'] = is_correct
-            
-            # 根据正确性处理correct_output
-            if is_correct == '√':
-                # 如果正确，直接复制ds_output到correct_output
-                new_row['correct_output'] = content
-                new_row['manual_review_needed'] = '否'
-                print(f"第 {actual_idx + 1} 条处理完成 - 判断正确，直接复制输出")
+            # 根据模式决定处理逻辑
+            if only_new_fields:
+                print(f"第 {actual_idx + 1} 条 - 增量更新模式：只处理新增字段")
+                # 增量更新模式：跳过原有字段的处理，只处理新增的三个字段
+                pass  # 跳过原有处理逻辑
             else:
-                # 如果不正确，使用正确CWE重新调用API
-                cwe_info = format_cwe_info(original_cwe)
-                if cwe_info:
-                    print(f"第 {actual_idx + 1} 条判断错误，使用正确CWE重新分析: {cwe_info}")
-                    changed_statements = row.get('changed_statements', '')  # 获取changed_statements字段，默认为空
-                    cve_list = row.get('cve_list', '')  # 获取cve_list字段，默认为空
-                    correct_content, manual_review_needed = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
-                    new_row['correct_output'] = correct_content
-                    new_row['manual_review_needed'] = '是' if manual_review_needed else '否'
-                    if manual_review_needed:
-                        print(f"第 {actual_idx + 1} 条二次分析完成，但需要人工校正")
-                    else:
-                        print(f"第 {actual_idx + 1} 条二次分析完成")
+                # 完整处理模式：检查是否已经存在所有必要字段，如果存在则跳过原有处理
+                skip_original_processing = (
+                    not pd.isna(new_row.get('ds_output', '')) and str(new_row.get('ds_output', '')).strip() != '' and
+                    not pd.isna(new_row.get('ds_result', '')) and str(new_row.get('ds_result', '')).strip() != '' and
+                    not pd.isna(new_row.get('ds_think', '')) and str(new_row.get('ds_think', '')).strip() != '' and
+                    not pd.isna(new_row.get('correct_output', '')) and str(new_row.get('correct_output', '')).strip() != ''
+                )
+                
+                # 根据条件判断是否跳过原有处理
+                if skip_original_processing:
+                    print(f"第 {actual_idx + 1} 条已存在所有必要字段，跳过原有处理")
+                    reasoning_content = new_row.get('ds_think', '')
+                    content = new_row.get('ds_output', '')
+                    # extracted_cwe = analyzer.extract_cwe_from_output(content)
+                    original_cwe = row['cwe_list']
+                    is_correct = new_row.get('is_correct', '')
                 else:
-                    new_row['correct_output'] = ''
-                    new_row['manual_review_needed'] = '是'  # 无有效CWE信息需要人工校正
-                    print(f"第 {actual_idx + 1} 条无有效CWE信息，需要人工校正")
+                    # 调用API分析
+                    reasoning_content, content = analyzer.analyze_function(func_body)
+                    
+                    # 存储结果
+                    new_row['ds_think'] = reasoning_content
+                    new_row['ds_output'] = content
+                    
+                    # 提取CWE并检查正确性
+                    extracted_cwe = analyzer.extract_cwe_from_output(content)
+                    new_row['ds_result'] = format_cwe_result(extracted_cwe)  # 新增
+                    
+                    original_cwe = row['cwe_list']
+                    is_correct = analyzer.check_cwe_correctness(original_cwe, extracted_cwe)
+                    new_row['is_correct'] = is_correct
+                    
+                    # 根据正确性处理correct_output
+                    if is_correct == '√':
+                        # 如果正确，直接复制ds_output到correct_output
+                        new_row['correct_output'] = content
+                        new_row['manual_review_needed'] = '否'
+                        print(f"第 {actual_idx + 1} 条处理完成 - 判断正确，直接复制输出")
+                    else:
+                        # 如果不正确，使用正确CWE重新调用API
+                        cwe_info = format_cwe_info(original_cwe)
+                        if cwe_info:
+                            print(f"第 {actual_idx + 1} 条判断错误，使用正确CWE重新分析: {cwe_info}")
+                            changed_statements = row.get('changed_statements', '')  # 获取changed_statements字段，默认为空
+                            cve_list = row.get('cve_list', '')  # 获取cve_list字段，默认为空
+                            correct_content, manual_review_needed = analyzer.generate_correct_output_with_retry(func_body, original_cwe, cve_list, changed_statements)
+                            new_row['correct_output'] = correct_content
+                            new_row['manual_review_needed'] = '是' if manual_review_needed else '否'
+                            if manual_review_needed:
+                                print(f"第 {actual_idx + 1} 条二次分析完成，但需要人工校正")
+                            else:
+                                print(f"第 {actual_idx + 1} 条二次分析完成")
+                        else:
+                            new_row['correct_output'] = ''
+                            new_row['manual_review_needed'] = '是'  # 无有效CWE信息需要人工校正
+                            print(f"第 {actual_idx + 1} 条无有效CWE信息，需要人工校正")
+                    
+                    # 对ds_think进行删减处理
+                    if reasoning_content:
+                        print(f"第 {actual_idx + 1} 条正在删减思维链内容，原长度: {len(reasoning_content)} 字符")
+                        reduced_thinking = analyzer.reduce_thinking_content(reasoning_content)
+                        new_row['ds_think_reduced'] = reduced_thinking
+                        print(f"第 {actual_idx + 1} 条思维链删减完成，新长度: {len(reduced_thinking)} 字符")
+                    else:
+                        new_row['ds_think_reduced'] = ''
+                    
+                    print(f"第 {actual_idx + 1} 条原始CWE: {original_cwe}")
+                    print(f"第 {actual_idx + 1} 条提取CWE: {extracted_cwe}")
+                    print(f"第 {actual_idx + 1} 条DS结果: {new_row['ds_result']}")  # 新增
+                    print(f"第 {actual_idx + 1} 条正确性: {is_correct}")
+                    print(f"第 {actual_idx + 1} 条人工校正: {new_row['manual_review_needed']}")  # 新增
+                    print(f"第 {actual_idx + 1} 条思维链长度: {len(reasoning_content)} 字符")
+                    print(f"第 {actual_idx + 1} 条正式输出: {content[:100]}..." if len(content) > 100 else f"正式输出: {content}")
+                    print("-" * 50)
             
-            # 对ds_think进行删减处理
-            if reasoning_content:
-                print(f"第 {actual_idx + 1} 条正在删减思维链内容，原长度: {len(reasoning_content)} 字符")
-                reduced_thinking = analyzer.reduce_thinking_content(reasoning_content)
-                new_row['ds_think_reduced'] = reduced_thinking
-                print(f"第 {actual_idx + 1} 条思维链删减完成，新长度: {len(reduced_thinking)} 字符")
-            else:
-                new_row['ds_think_reduced'] = ''
-            
-            actual_idx = df_valid.index.get_loc(idx)
-            print(f"第 {actual_idx + 1} 条原始CWE: {original_cwe}")
-            print(f"第 {actual_idx + 1} 条提取CWE: {extracted_cwe}")
-            print(f"第 {actual_idx + 1} 条DS结果: {new_row['ds_result']}")  # 新增
-            print(f"第 {actual_idx + 1} 条正确性: {is_correct}")
-            print(f"第 {actual_idx + 1} 条人工校正: {new_row['manual_review_needed']}")  # 新增
-            print(f"第 {actual_idx + 1} 条思维链长度: {len(reasoning_content)} 字符")
-            print(f"第 {actual_idx + 1} 条正式输出: {content[:100]}..." if len(content) > 100 else f"正式输出: {content}")
-            print("-" * 50)
+            # 新增功能：生成prompt7, ds_thinking7, ds_response7三个字段（无论什么模式都要处理）
+            try:
+                # 获取必要的信息
+                original_cwe = row['cwe_list']
+                cwe_info = format_cwe_info(original_cwe)  # 需要格式化CWE信息用于判断
+                changed_statements = row.get('changed_statements', '')
+                
+                if cwe_info:
+                    print(f"第 {actual_idx + 1} 条正在生成专门漏洞分析...")
+                    prompt7, ds_thinking7, ds_response7 = analyzer.analyze_vulnerability_focused(func_body, original_cwe, changed_statements)
+                    
+                    new_row['prompt7'] = prompt7
+                    new_row['ds_thinking7'] = ds_thinking7
+                    new_row['ds_response7'] = ds_response7
+                    
+                    print(f"第 {actual_idx + 1} 条专门漏洞分析完成")
+                else:
+                    print(f"第 {actual_idx + 1} 条无有效CWE信息，跳过专门漏洞分析")
+                    new_row['prompt7'] = ''
+                    new_row['ds_thinking7'] = ''
+                    new_row['ds_response7'] = ''
+                    
+            except Exception as e:
+                print(f"第 {actual_idx + 1} 条专门漏洞分析失败: {e}")
+                new_row['prompt7'] = ''
+                new_row['ds_thinking7'] = f'分析失败: {e}'
+                new_row['ds_response7'] = ''
             
             # 添加延迟避免API限流
             time.sleep(1)
@@ -884,13 +1152,26 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
         except Exception as e:
             actual_idx = df_valid.index.get_loc(idx)
             print(f"处理第 {actual_idx + 1} 条记录时出错: {e}")
-            new_row['ds_think'] = f'处理错误: {e}'
-            new_row['ds_output'] = ''
-            new_row['ds_result'] = '处理错误'  # 新增
-            new_row['is_correct'] = '×'
-            new_row['correct_output'] = ''
-            new_row['ds_think_reduced'] = ''  # 新增
-            new_row['manual_review_needed'] = '是'  # 处理错误需要人工校正
+            
+            # 根据模式处理错误
+            if only_new_fields:
+                # 增量模式：只设置新增字段的错误信息
+                new_row['prompt7'] = ''
+                new_row['ds_thinking7'] = f'处理错误: {e}'
+                new_row['ds_response7'] = ''
+            else:
+                # 完整模式：设置所有字段的错误信息
+                new_row['ds_think'] = f'处理错误: {e}'
+                new_row['ds_output'] = ''
+                new_row['ds_result'] = '处理错误'  # 新增
+                new_row['is_correct'] = '×'
+                new_row['correct_output'] = ''
+                new_row['ds_think_reduced'] = ''  # 新增
+                new_row['manual_review_needed'] = '是'  # 处理错误需要人工校正
+                # 新增字段的错误处理
+                new_row['prompt7'] = ''
+                new_row['ds_thinking7'] = f'处理错误: {e}'
+                new_row['ds_response7'] = ''
             return new_row
     
     # 多线程处理
@@ -907,35 +1188,65 @@ def process_file(input_file: str, output_file: str, api_key: str, bailian_api_ke
     # 按原始索引顺序构建结果DataFrame
     new_df = pd.DataFrame([processed_rows[idx] for idx in sorted(processed_rows.keys())])
     
-    # 最终保存完整文件
-    save_file(new_df, output_file)
-    print(f"处理完成！结果已保存到 {output_file}")
+    # 根据模式决定保存的列
+    if only_new_fields:
+        # 增量更新模式：保存原有列 + 新增的三个字段
+        # 智能过滤：排除空的Unnamed列，但保留有数据的Unnamed列
+        original_columns = []
+        for col in df.columns:
+            if str(col).startswith('Unnamed'):
+                # 检查该列是否全为空
+                if not df[col].isna().all():
+                    original_columns.append(col)  # 保留有数据的Unnamed列
+                    print(f"保留有数据的Unnamed列: {col}")
+                else:
+                    print(f"跳过空的Unnamed列: {col}")
+                # 跳过空的Unnamed列
+            else:
+                original_columns.append(col)  # 保留所有非Unnamed列
+        save_columns = original_columns + ['prompt7', 'ds_thinking7', 'ds_response7']
+        # 去重并保持原有顺序
+        save_columns = list(dict.fromkeys(save_columns))
+        # 确保所有需要保存的列都存在
+        save_columns = [col for col in save_columns if col in new_df.columns]
+        df_to_save = new_df[save_columns]
+        save_file(df_to_save, output_file)
+        print(f"增量更新完成！只保存原有列和新增的三个字段，共 {len(save_columns)} 列，结果已保存到 {output_file}")
+    else:
+        # 完整处理模式：保存所有列
+        save_file(new_df, output_file)
+        print(f"完整处理完成！结果已保存到 {output_file}")
     
     # 统计结果
-    correct_count = (new_df['is_correct'] == '√').sum()
-    total_count = len(new_df[new_df['is_correct'].isin(['√', '×'])])
-    accuracy = correct_count / total_count * 100 if total_count > 0 else 0
-    
-    # 人工校正统计
-    manual_review_count = (new_df['manual_review_needed'] == '是').sum()
-    manual_review_rate = manual_review_count / len(new_df) * 100 if len(new_df) > 0 else 0
-    
     print(f"\n统计结果:")
     print(f"原始总记录数: {len(df)}")
     print(f"有效记录数: {len(df_valid)}")
     print(f"跳过记录数: {len(invalid_rows)}")
     print(f"处理记录数: {len(new_df)}")
-    print(f"成功处理: {total_count}")
-    print(f"正确匹配: {correct_count}")
-    print(f"准确率: {accuracy:.2f}%")
-    print(f"需要人工校正: {manual_review_count}/{len(new_df)} ({manual_review_rate:.2f}%)")
     
-    # 如果有需要人工校正的记录，生成单独的文件
-    if manual_review_count > 0:
-        manual_review_df = new_df[new_df['manual_review_needed'] == '是'].copy()
-        manual_review_file = os.path.splitext(output_file)[0] + "_manual_review.csv"
-        save_file(manual_review_df, manual_review_file)
-        print(f"需要人工校正的 {manual_review_count} 条记录已保存到: {manual_review_file}")
+    if only_new_fields:
+        print(f"增量更新模式：只处理了新增的三个字段（prompt7, ds_thinking7, ds_response7）")
+    else:
+        # 完整处理模式：进行详细统计
+        correct_count = (new_df['is_correct'] == '√').sum()
+        total_count = len(new_df[new_df['is_correct'].isin(['√', '×'])])
+        accuracy = correct_count / total_count * 100 if total_count > 0 else 0
+        
+        # 人工校正统计
+        manual_review_count = (new_df['manual_review_needed'] == '是').sum()
+        manual_review_rate = manual_review_count / len(new_df) * 100 if len(new_df) > 0 else 0
+        
+        print(f"成功处理: {total_count}")
+        print(f"正确匹配: {correct_count}")
+        print(f"准确率: {accuracy:.2f}%")
+        print(f"需要人工校正: {manual_review_count}/{len(new_df)} ({manual_review_rate:.2f}%)")
+        
+        # 如果有需要人工校正的记录，生成单独的文件
+        if manual_review_count > 0:
+            manual_review_df = new_df[new_df['manual_review_needed'] == '是'].copy()
+            manual_review_file = os.path.splitext(output_file)[0] + "_manual_review.csv"
+            save_file(manual_review_df, manual_review_file)
+            print(f"需要人工校正的 {manual_review_count} 条记录已保存到: {manual_review_file}")
 
 def validate_correct_result_column(input_file: str, bailian_api_key: str, max_workers: int = 5):
     """
@@ -1067,7 +1378,7 @@ if __name__ == "__main__":
         exit(1)
     
     # 检查必需的配置项
-    required_configs = ["INPUT_FILE", "DEEPSEEK_API_KEY", "BAILIAN_API_KEY"]
+    required_configs = ["INPUT_FILE", "DEEPSEEK_API_KEY"]
     missing_configs = [key for key in required_configs if key not in config]
     if missing_configs:
         print(f"错误: 配置文件中缺少必需的配置项: {missing_configs}")
@@ -1078,14 +1389,32 @@ if __name__ == "__main__":
     # 输出文件名根据输出路径文件名命令，加上 result 后缀
     OUTPUT_FILE = os.path.splitext(os.path.basename(INPUT_FILE))[0] + "_result.csv"
     API_KEY = config["DEEPSEEK_API_KEY"]  # 从配置文件获取API密钥
-    BAILIAN_API_KEY = config["BAILIAN_API_KEY"]
+    
+    # 处理百炼API配置异常
+    BAILIAN_API_KEY = config.get("BAILIAN_API_KEY", "")
+    if not BAILIAN_API_KEY or BAILIAN_API_KEY == "your_bailian_api_key":
+        print("警告: 百炼API配置异常，将使用DeepSeek API替代")
+        BAILIAN_API_KEY = "your_bailian_api_key"  # 设置为默认值，在DeepSeekAnalyzer中会处理
+    
     MAX_WORKERS = config.get("MAX_WORKERS", 5)  # 最大线程数，默认为5
     SHEET_NAME = None  # Excel工作表名称，None表示使用第一个工作表
     USE_MODEL_EXTRACTION = True
+    ONLY_NEW_FIELDS = config.get("ONLY_NEW_FIELDS", False)  # 是否只处理新增的三个字段，默认为False
+    
+    print(f"配置信息:")
+    print(f"输入文件: {INPUT_FILE}")
+    print(f"输出文件: {OUTPUT_FILE}")
+    print(f"最大线程数: {MAX_WORKERS}")
+    if ONLY_NEW_FIELDS:
+        print(f"处理模式: 增量更新 - 只处理新增字段 (prompt7, ds_thinking7, ds_response7)")
+        print(f"注意: 将跳过其他所有字段的处理，适用于已处理过的文件")
+    else:
+        print(f"处理模式: 完整处理 - 处理所有字段")
+    print("-" * 60)
     
     start_time = time.time()
-    process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, BAILIAN_API_KEY, sheet_name=SHEET_NAME, max_workers=MAX_WORKERS, use_model_extraction=USE_MODEL_EXTRACTION)
+    process_file(INPUT_FILE, OUTPUT_FILE, API_KEY, BAILIAN_API_KEY, sheet_name=SHEET_NAME, max_workers=MAX_WORKERS, use_model_extraction=USE_MODEL_EXTRACTION, only_new_fields=ONLY_NEW_FIELDS)
     # 后处理：检查并重新处理缺失的行
-    post_process_missing_rows(OUTPUT_FILE, API_KEY, BAILIAN_API_KEY, max_workers=MAX_WORKERS, use_model_extraction=USE_MODEL_EXTRACTION)
+    post_process_missing_rows(OUTPUT_FILE, API_KEY, BAILIAN_API_KEY, max_workers=MAX_WORKERS, use_model_extraction=USE_MODEL_EXTRACTION, only_new_fields=ONLY_NEW_FIELDS)
     end_time = time.time()
     print(f"处理完成！总耗时: {(end_time - start_time) / 60:.2f}分钟")
